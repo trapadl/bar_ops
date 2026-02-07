@@ -1,6 +1,13 @@
 import { AppConfig, ComparableNight, HistorySnapshot, LiveSnapshot, RevenueBucket } from "@/lib/types";
 import { averageSeries, buildBaselineFractions, computeProjection, computeWageSeries, cumulative, getBaselineFractionAtIndex, toPercent } from "@/lib/math";
-import { buildBucketLabels, getZonedNow, minutesInOperatingWindow, minutesSinceOpening } from "@/lib/time";
+import {
+  buildBucketLabels,
+  BUSINESS_DAY_START_HOUR,
+  getZonedNow,
+  minutesInOperatingWindow,
+  minutesSinceOpening,
+  toBusinessDayReference,
+} from "@/lib/time";
 import { getOperatingHoursForDay } from "@/lib/config";
 
 const BUCKET_MINUTES = 15;
@@ -104,7 +111,8 @@ function averageRevenue(nights: ComparableNight[]): number {
 }
 
 function buildHistoryModel(config: AppConfig, now: Date): HistorySnapshot {
-  const zonedNow = getZonedNow(now, config.timezone);
+  const serviceReference = toBusinessDayReference(now, BUSINESS_DAY_START_HOUR);
+  const zonedNow = getZonedNow(serviceReference, config.timezone);
   const operatingHours = getOperatingHoursForDay(config, zonedNow.dayKey);
   const targets = config.dailyTargets[zonedNow.dayKey];
 
@@ -203,6 +211,7 @@ export function buildLiveSnapshot(config: AppConfig, now = new Date()): LiveSnap
   const history = buildHistoryModel(config, now);
   const targets = config.dailyTargets[history.dayKey];
   const operatingHours = getOperatingHoursForDay(config, history.dayKey);
+  const serviceReference = toBusinessDayReference(now, BUSINESS_DAY_START_HOUR);
 
   if (operatingHours.isClosed) {
     return {
@@ -268,7 +277,7 @@ export function buildLiveSnapshot(config: AppConfig, now = new Date()): LiveSnap
   const nightlyExpectation = Math.round(history.rollingAverageRevenueCents * tonightPerformance);
   const fullNightRevenue = scaleShapeToTotal(demandShape, nightlyExpectation);
 
-  const zonedNow = getZonedNow(now, config.timezone);
+  const zonedNow = getZonedNow(serviceReference, config.timezone);
   const operatingWindowMinutes = minutesInOperatingWindow(
     operatingHours.openingTime,
     operatingHours.closingTime,

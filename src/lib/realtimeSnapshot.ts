@@ -7,7 +7,13 @@ import {
   getBaselineFractionAtIndex,
   toPercent,
 } from "@/lib/math";
-import { buildBucketLabels, getZonedNow, parseClockToMinutes } from "@/lib/time";
+import {
+  buildBucketLabels,
+  BUSINESS_DAY_START_HOUR,
+  getZonedNow,
+  parseClockToMinutes,
+  toBusinessDayReference,
+} from "@/lib/time";
 import { AppConfig, LiveSnapshot, OperatingHours } from "@/lib/types";
 
 const BUCKET_MINUTES = 15;
@@ -265,6 +271,14 @@ function parseDateValue(value: unknown): Date | null {
 
 function normalizeLabel(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function isOrderInReportingWindow(order: SquareOrder, windowStartMs: number): boolean {
+  if (!order.createdAt) {
+    return true;
+  }
+
+  return order.createdAt.getTime() >= windowStartMs;
 }
 
 function pickOrderLabel(order: Record<string, unknown>): string | null {
@@ -784,7 +798,11 @@ async function settled<T>(work: () => Promise<T>): Promise<PromiseResult<T>> {
 }
 
 function buildClosedSnapshot(config: AppConfig, referenceDate: Date): LiveSnapshot {
-  const dayKey = getZonedNow(referenceDate, config.timezone).dayKey;
+  const serviceReference = toBusinessDayReference(
+    referenceDate,
+    BUSINESS_DAY_START_HOUR,
+  );
+  const dayKey = getZonedNow(serviceReference, config.timezone).dayKey;
   const targetWage = config.dailyTargets[dayKey].wageTargetPercent;
 
   return {
@@ -839,7 +857,11 @@ export async function buildRealtimeSnapshot(
   referenceDate: Date,
   log: IntegrationLogFn = () => {},
 ): Promise<RealtimeBuildResult> {
-  const zonedReference = getZonedNow(referenceDate, config.timezone);
+  const serviceReference = toBusinessDayReference(
+    referenceDate,
+    BUSINESS_DAY_START_HOUR,
+  );
+  const zonedReference = getZonedNow(serviceReference, config.timezone);
   const dayKey = zonedReference.dayKey;
   const target = config.dailyTargets[dayKey];
   const operatingHours = getOperatingHoursForDay(config, dayKey);
@@ -880,7 +902,7 @@ export async function buildRealtimeSnapshot(
   );
   const bucketCount = labels.length;
 
-  const localDate = getLocalDateParts(referenceDate, config.timezone);
+  const localDate = getLocalDateParts(serviceReference, config.timezone);
   const window = buildOperatingWindow(localDate, operatingHours, config.timezone);
   const windowStartMs = window.start.getTime();
   const windowEndMs = window.end.getTime();
@@ -977,8 +999,15 @@ export async function buildRealtimeSnapshot(
     matchesAnyExcludedLabel(order.label, excludedOpenOrderLabels),
   );
   const includedOpenOrders = openOrders.filter(
-    (order) => !matchesAnyExcludedLabel(order.label, excludedOpenOrderLabels),
+    (order) =>
+      !matchesAnyExcludedLabel(order.label, excludedOpenOrderLabels) &&
+      isOrderInReportingWindow(order, windowStartMs),
   );
+  const includedOpenOrdersOutsideWindowCount = openOrders.filter(
+    (order) =>
+      !matchesAnyExcludedLabel(order.label, excludedOpenOrderLabels) &&
+      !isOrderInReportingWindow(order, windowStartMs),
+  ).length;
 
   const includedOpenBillsCents = includedOpenOrders.reduce(
     (sum, order) => sum + Math.max(0, order.amountCents),
@@ -1005,6 +1034,7 @@ export async function buildRealtimeSnapshot(
   log("realtime", "Open order filtering", {
     totalOpenOrderCount: openOrders.length,
     includedOpenOrderCount: includedOpenOrders.length,
+    includedOpenOrdersOutsideWindowCount,
     excludedOpenOrderCount: excludedOpenOrders.length,
     includedOpenBillsCents,
     excludedOpenOrdersTotalCents,

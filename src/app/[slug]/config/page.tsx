@@ -183,21 +183,10 @@ function ConfigEditor({
   }, [openTableOptions]);
 
   const selectableExcludedLabels = useMemo(() => {
-    const labels = new Set<string>();
-
-    for (const label of draftConfig.excludedOpenOrderLabels) {
-      const cleaned = label.trim().toLowerCase();
-      if (cleaned) {
-        labels.add(cleaned);
-      }
-    }
-
-    for (const option of openTableOptions) {
-      labels.add(option.label);
-    }
-
-    return Array.from(labels).sort((left, right) => left.localeCompare(right));
-  }, [draftConfig.excludedOpenOrderLabels, openTableOptions]);
+    return openTableOptions
+      .map((option) => option.label)
+      .sort((left, right) => left.localeCompare(right));
+  }, [openTableOptions]);
 
   const toggleExcludedLabel = (label: string, checked: boolean): void => {
     updateDraft((previous) => {
@@ -374,7 +363,7 @@ function ConfigEditor({
                         {label}
                         {option
                           ? ` (${option.orderCount} open, $${(option.totalCents / 100).toFixed(2)})`
-                          : " (saved, not currently open)"}
+                          : ""}
                       </span>
                     </label>
                   );

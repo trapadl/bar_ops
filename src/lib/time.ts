@@ -2,6 +2,9 @@ import { getDayKeyFromWeekdayLabel } from "@/lib/config";
 import { DayKey } from "@/lib/types";
 
 const MINUTES_PER_DAY = 24 * 60;
+const HOURS_PER_DAY = 24;
+
+export const BUSINESS_DAY_START_HOUR = 5;
 
 export function parseClockToMinutes(clock: string): number {
   const [hours, minutes] = clock.split(":").map((part) => Number(part));
@@ -87,6 +90,14 @@ export interface ZonedNow {
   dayKey: DayKey;
   hour: number;
   minute: number;
+}
+
+export function toBusinessDayReference(
+  date: Date,
+  boundaryHour = BUSINESS_DAY_START_HOUR,
+): Date {
+  const safeBoundaryHour = Math.min(Math.max(boundaryHour, 0), HOURS_PER_DAY - 1);
+  return new Date(date.getTime() - safeBoundaryHour * 60 * 60 * 1000);
 }
 
 export function getZonedNow(date: Date, timeZone: string): ZonedNow {

@@ -414,11 +414,12 @@ export default function DashboardPage(): React.JSX.Element {
           </p>
           <p>Target Wage: {formatPercent(targetWagePercent, 1)}</p>
           <p>
-            Hours:{" "}
+            Operating Hours:{" "}
             {operatingHours.isClosed
               ? "Closed"
               : `${operatingHours.openingTime} - ${operatingHours.closingTime}`}
           </p>
+          <p>Reporting Window: 05:00 - 05:00</p>
           <p className="muted">
             Last refresh {formatClockIso(snapshot.generatedAtIso, config.timezone)}
           </p>

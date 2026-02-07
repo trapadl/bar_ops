@@ -8,7 +8,8 @@ import {
   minutesSinceOpening,
   toBusinessDayReference,
 } from "@/lib/time";
-import { getOperatingHoursForDay } from "@/lib/config";
+const REPORTING_WINDOW_OPENING = "05:00";
+const REPORTING_WINDOW_CLOSING = "05:00";
 
 const BUCKET_MINUTES = 15;
 
@@ -113,21 +114,11 @@ function averageRevenue(nights: ComparableNight[]): number {
 function buildHistoryModel(config: AppConfig, now: Date): HistorySnapshot {
   const serviceReference = toBusinessDayReference(now, BUSINESS_DAY_START_HOUR);
   const zonedNow = getZonedNow(serviceReference, config.timezone);
-  const operatingHours = getOperatingHoursForDay(config, zonedNow.dayKey);
   const targets = config.dailyTargets[zonedNow.dayKey];
 
-  if (operatingHours.isClosed) {
-    return {
-      dayKey: zonedNow.dayKey,
-      lastWeekRevenueCents: 0,
-      rollingAverageRevenueCents: 0,
-      comparableNights: [],
-    };
-  }
-
   const labels = buildBucketLabels(
-    operatingHours.openingTime,
-    operatingHours.closingTime,
+    REPORTING_WINDOW_OPENING,
+    REPORTING_WINDOW_CLOSING,
     BUCKET_MINUTES,
   );
   const keySeed = seedFromString(`${zonedNow.dayKey}:${config.storeName}`);
@@ -210,60 +201,11 @@ function buildRevenueBuckets(
 export function buildLiveSnapshot(config: AppConfig, now = new Date()): LiveSnapshot {
   const history = buildHistoryModel(config, now);
   const targets = config.dailyTargets[history.dayKey];
-  const operatingHours = getOperatingHoursForDay(config, history.dayKey);
   const serviceReference = toBusinessDayReference(now, BUSINESS_DAY_START_HOUR);
 
-  if (operatingHours.isClosed) {
-    return {
-      generatedAtIso: now.toISOString(),
-      dayKey: history.dayKey,
-      totals: {
-        actualRevenueCents: 0,
-        openBillsCents: 0,
-        adjustedRevenueCents: 0,
-        projectedRevenueCents: 0,
-        projectedVsTargetPercent: 0,
-        laborCostCents: 0,
-        wagePercent: null,
-      },
-      comparison: {
-        lastWeekRevenueCents: 0,
-        rollingAverageRevenueCents: 0,
-      },
-      projection: {
-        baselineFraction: 0,
-        rawProjectedTotalCents: 0,
-        rampedProjectedTotalCents: 0,
-        rampWeight: 0,
-        elapsedFraction: 0,
-      },
-      timeline: {
-        revenueBuckets: [
-          {
-            bucketIndex: 0,
-            label: "Closed",
-            closedRevenueCents: 0,
-            openBillsCents: 0,
-            laborCostCents: 0,
-          },
-        ],
-        baselineFractions: [0],
-        wageSeries: [
-          {
-            label: "Closed",
-            currentPercent: null,
-            targetPercent: targets.wageTargetPercent,
-            historicalPercent: 0,
-          },
-        ],
-        historicalWagePercentByBucket: [0],
-      },
-    };
-  }
-
   const labels = buildBucketLabels(
-    operatingHours.openingTime,
-    operatingHours.closingTime,
+    REPORTING_WINDOW_OPENING,
+    REPORTING_WINDOW_CLOSING,
     BUCKET_MINUTES,
   );
   const bucketCount = labels.length;
@@ -279,14 +221,14 @@ export function buildLiveSnapshot(config: AppConfig, now = new Date()): LiveSnap
 
   const zonedNow = getZonedNow(serviceReference, config.timezone);
   const operatingWindowMinutes = minutesInOperatingWindow(
-    operatingHours.openingTime,
-    operatingHours.closingTime,
+    REPORTING_WINDOW_OPENING,
+    REPORTING_WINDOW_CLOSING,
   );
   const elapsedMinutes = minutesSinceOpening(
     zonedNow.hour,
     zonedNow.minute,
-    operatingHours.openingTime,
-    operatingHours.closingTime,
+    REPORTING_WINDOW_OPENING,
+    REPORTING_WINDOW_CLOSING,
   );
   const elapsedFraction = clamp(elapsedMinutes / operatingWindowMinutes, 0, 1);
   const completedBucketCount = clamp(Math.ceil(elapsedMinutes / BUCKET_MINUTES), 0, bucketCount);

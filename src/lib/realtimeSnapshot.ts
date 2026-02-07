@@ -1,4 +1,3 @@
-import { getOperatingHoursForDay } from "@/lib/config";
 import {
   buildBaselineFractions,
   computeProjection,
@@ -19,6 +18,8 @@ import { AppConfig, LiveSnapshot, OperatingHours } from "@/lib/types";
 const BUCKET_MINUTES = 15;
 const BUCKET_MILLISECONDS = BUCKET_MINUTES * 60 * 1000;
 const MAX_SQUARE_PAGES = 40;
+const REPORTING_WINDOW_OPENING = "05:00";
+const REPORTING_WINDOW_CLOSING = "05:00";
 
 type IntegrationStatus = "fulfilled" | "rejected" | "skipped";
 
@@ -228,6 +229,36 @@ async function parseJsonResponse(response: Response): Promise<unknown> {
   }
 }
 
+function withDeputyAuthHeader(
+  headers: HeadersInit | undefined,
+  token: string,
+  scheme: "Bearer" | "OAuth",
+): Headers {
+  const merged = new Headers(headers ?? {});
+  merged.set("Authorization", `${scheme} ${token}`);
+  return merged;
+}
+
+async function fetchDeputyWithAuthFallback(
+  url: string,
+  init: RequestInit,
+  token: string,
+): Promise<Response> {
+  const bearerResponse = await fetch(url, {
+    ...init,
+    headers: withDeputyAuthHeader(init.headers, token, "Bearer"),
+  });
+
+  if (bearerResponse.status !== 401 && bearerResponse.status !== 403) {
+    return bearerResponse;
+  }
+
+  return fetch(url, {
+    ...init,
+    headers: withDeputyAuthHeader(init.headers, token, "OAuth"),
+  });
+}
+
 function parseNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -249,15 +280,31 @@ function parseDateValue(value: unknown): Date | null {
   }
 
   if (typeof value === "number") {
+    if (value <= 0) {
+      return null;
+    }
     const milliseconds = value > 1e12 ? value : value * 1000;
     const parsed = new Date(milliseconds);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
 
   if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric) && numeric <= 0) {
+      return null;
+    }
+
     const deputyMatch = value.match(/\/Date\((\d+)(?:[+-]\d+)?\)\//);
     if (deputyMatch) {
       const milliseconds = Number(deputyMatch[1]);
+      if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+        return null;
+      }
       const parsed = new Date(milliseconds);
       return Number.isNaN(parsed.getTime()) ? null : parsed;
     }
@@ -482,14 +529,17 @@ async function fetchDeputyCollection(
 
   for (const path of paths) {
     const url = new URL(path, config.deputy.baseUrl);
-    const response = await fetch(url.toString(), {
+    const response = await fetchDeputyWithAuthFallback(
+      url.toString(),
+      {
       method: "GET",
       headers: {
         Accept: "application/json",
-        Authorization: `Bearer ${config.deputy.accessToken}`,
       },
       cache: "no-store",
-    });
+      },
+      config.deputy.accessToken,
+    );
 
     const body = await parseJsonResponse(response);
     if (!response.ok) {
@@ -510,6 +560,71 @@ async function fetchDeputyCollection(
   }
 
   throw new Error(`Deputy endpoints failed: ${errors.join(", ")}`);
+}
+
+async function fetchDeputyTimesheets(
+  config: AppConfig,
+  window: WindowRange,
+): Promise<unknown[]> {
+  const minStartUnix = Math.floor((window.start.getTime() - 12 * 60 * 60 * 1000) / 1000);
+  const queryPaths = [
+    "/api/v1/resource/Timesheet/QUERY",
+    "/api/v1/supervise/timesheet/QUERY",
+  ];
+  const queryErrors: string[] = [];
+
+  for (const path of queryPaths) {
+    const url = new URL(path, config.deputy.baseUrl);
+    const response = await fetchDeputyWithAuthFallback(
+      url.toString(),
+      {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        search: {
+          s1: {
+            field: "StartTime",
+            data: minStartUnix,
+            type: "ge",
+          },
+        },
+      }),
+      cache: "no-store",
+      },
+      config.deputy.accessToken,
+    );
+
+    const body = await parseJsonResponse(response);
+    if (!response.ok) {
+      queryErrors.push(`${path}: ${response.status}`);
+      continue;
+    }
+
+    if (Array.isArray(body)) {
+      return body;
+    }
+
+    const payload = body as { data?: unknown[] };
+    if (Array.isArray(payload.data)) {
+      return payload.data;
+    }
+
+    return [];
+  }
+
+  const fallback = await fetchDeputyCollection(config, [
+    "/api/v1/resource/Timesheet?max=500",
+    "/api/v1/supervise/timesheet?max=500",
+  ]);
+
+  if (fallback.length > 0) {
+    return fallback;
+  }
+
+  throw new Error(`Deputy timesheet query endpoints failed: ${queryErrors.join(", ")}`);
 }
 
 function extractSquarePayments(rawPayments: unknown[]): SquarePayment[] {
@@ -617,11 +732,20 @@ function extractDeputyTimesheets(raw: unknown[]): DeputyTimesheet[] {
       continue;
     }
 
+    const inProgressRaw = timesheet.IsInProgress ?? timesheet.is_in_progress;
+    const isInProgress =
+      inProgressRaw === true ||
+      inProgressRaw === 1 ||
+      inProgressRaw === "1" ||
+      inProgressRaw === "true";
+
     const endAt =
-      parseDateValue(timesheet.EndTime) ??
-      parseDateValue(timesheet.EndTimeLocalized) ??
-      parseDateValue(timesheet.end_time) ??
-      parseDateValue(timesheet.end) ??
+      (isInProgress
+        ? null
+        : parseDateValue(timesheet.EndTime) ??
+          parseDateValue(timesheet.EndTimeLocalized) ??
+          parseDateValue(timesheet.end_time) ??
+          parseDateValue(timesheet.end)) ??
       null;
 
     const employeeId =
@@ -797,61 +921,6 @@ async function settled<T>(work: () => Promise<T>): Promise<PromiseResult<T>> {
   }
 }
 
-function buildClosedSnapshot(config: AppConfig, referenceDate: Date): LiveSnapshot {
-  const serviceReference = toBusinessDayReference(
-    referenceDate,
-    BUSINESS_DAY_START_HOUR,
-  );
-  const dayKey = getZonedNow(serviceReference, config.timezone).dayKey;
-  const targetWage = config.dailyTargets[dayKey].wageTargetPercent;
-
-  return {
-    generatedAtIso: new Date().toISOString(),
-    dayKey,
-    totals: {
-      actualRevenueCents: 0,
-      openBillsCents: 0,
-      adjustedRevenueCents: 0,
-      projectedRevenueCents: 0,
-      projectedVsTargetPercent: 0,
-      laborCostCents: 0,
-      wagePercent: null,
-    },
-    comparison: {
-      lastWeekRevenueCents: 0,
-      rollingAverageRevenueCents: 0,
-    },
-    projection: {
-      baselineFraction: 0,
-      rawProjectedTotalCents: 0,
-      rampedProjectedTotalCents: 0,
-      rampWeight: 0,
-      elapsedFraction: 0,
-    },
-    timeline: {
-      revenueBuckets: [
-        {
-          bucketIndex: 0,
-          label: "Closed",
-          closedRevenueCents: 0,
-          openBillsCents: 0,
-          laborCostCents: 0,
-        },
-      ],
-      baselineFractions: [0],
-      wageSeries: [
-        {
-          label: "Closed",
-          currentPercent: null,
-          targetPercent: targetWage,
-          historicalPercent: targetWage,
-        },
-      ],
-      historicalWagePercentByBucket: [targetWage],
-    },
-  };
-}
-
 export async function buildRealtimeSnapshot(
   config: AppConfig,
   referenceDate: Date,
@@ -864,46 +933,21 @@ export async function buildRealtimeSnapshot(
   const zonedReference = getZonedNow(serviceReference, config.timezone);
   const dayKey = zonedReference.dayKey;
   const target = config.dailyTargets[dayKey];
-  const operatingHours = getOperatingHoursForDay(config, dayKey);
-
-  if (operatingHours.isClosed) {
-    return {
-      snapshot: buildClosedSnapshot(config, referenceDate),
-      integration: {
-        mode: "realtime",
-        fetchedAtIso: new Date().toISOString(),
-        status: {
-          squarePayments: "skipped",
-          squareOpenOrders: "skipped",
-          deputyTimesheets: "skipped",
-          deputyEmployees: "skipped",
-          historicalWeek1: "skipped",
-          historicalWeek2: "skipped",
-          historicalWeek3: "skipped",
-          historicalWeek4: "skipped",
-        },
-        counts: {
-          squarePayments: 0,
-          squareOpenOrders: 0,
-          squareOpenOrdersExcluded: 0,
-          squareOpenOrdersExcludedCarryoverCents: 0,
-          squareOpenOrdersExcludedDeltaCents: 0,
-          deputyTimesheets: 0,
-          deputyEmployees: 0,
-        },
-      },
-    };
-  }
+  const reportingWindowHours: OperatingHours = {
+    openingTime: REPORTING_WINDOW_OPENING,
+    closingTime: REPORTING_WINDOW_CLOSING,
+    isClosed: false,
+  };
 
   const labels = buildBucketLabels(
-    operatingHours.openingTime,
-    operatingHours.closingTime,
+    reportingWindowHours.openingTime,
+    reportingWindowHours.closingTime,
     BUCKET_MINUTES,
   );
   const bucketCount = labels.length;
 
   const localDate = getLocalDateParts(serviceReference, config.timezone);
-  const window = buildOperatingWindow(localDate, operatingHours, config.timezone);
+  const window = buildOperatingWindow(localDate, reportingWindowHours, config.timezone);
   const windowStartMs = window.start.getTime();
   const windowEndMs = window.end.getTime();
   const nowMs = Date.now();
@@ -919,6 +963,7 @@ export async function buildRealtimeSnapshot(
 
   log("realtime", "Window", {
     dayKey,
+    reportingWindow: `${REPORTING_WINDOW_OPENING}-${REPORTING_WINDOW_CLOSING}`,
     localDate,
     windowStartIso: window.start.toISOString(),
     windowEndIso: window.end.toISOString(),
@@ -933,12 +978,7 @@ export async function buildRealtimeSnapshot(
   ] = await Promise.all([
     settled(() => fetchSquarePayments(config, window)),
     settled(() => fetchSquareOpenOrders(config)),
-    settled(() =>
-      fetchDeputyCollection(config, [
-        "/api/v1/resource/Timesheet?max=500",
-        "/api/v1/supervise/timesheet?max=500",
-      ]),
-    ),
+    settled(() => fetchDeputyTimesheets(config, window)),
     settled(() =>
       fetchDeputyCollection(config, [
         "/api/v1/resource/Employee?max=500",
@@ -979,6 +1019,13 @@ export async function buildRealtimeSnapshot(
     deputyEmployeesResult.status === "fulfilled"
       ? extractDeputyEmployeeRateMap(deputyEmployeesResult.value ?? [])
       : new Map<number, number>();
+
+  log("realtime", "Deputy timesheets parsed", {
+    rawStatus: deputyTimesheetsResult.status,
+    parsedTimesheets: timesheets.length,
+    inProgressTimesheets: timesheets.filter((timesheet) => timesheet.endAt === null).length,
+    employeeRateCount: employeeRates.size,
+  });
 
   const closedRevenueByBucket = bucketizeRevenue(
     payments,
@@ -1071,7 +1118,7 @@ export async function buildRealtimeSnapshot(
     const compareDate = addDays(localDate, -7 * week);
     const compareWindow = buildOperatingWindow(
       compareDate,
-      operatingHours,
+      reportingWindowHours,
       config.timezone,
     );
 

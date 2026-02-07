@@ -425,6 +425,16 @@ input {
   padding: 0.56rem 0.7rem;
 }
 
+textarea {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid rgba(41, 69, 106, 0.9);
+  background: rgba(6, 10, 18, 0.8);
+  color: var(--text);
+  padding: 0.56rem 0.7rem;
+  resize: vertical;
+}
+
 select {
   width: 100%;
   border-radius: 12px;
@@ -435,9 +445,36 @@ select {
 }
 
 input:focus-visible,
+textarea:focus-visible,
 select:focus-visible {
   outline: 2px solid rgba(56, 208, 167, 0.5);
   outline-offset: 1px;
+}
+
+.open-table-picker {
+  margin-top: 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.55rem;
+  border-radius: 12px;
+  border: 1px solid rgba(41, 69, 106, 0.7);
+  background: rgba(8, 14, 24, 0.7);
+  max-height: 220px;
+  overflow: auto;
+}
+
+.open-table-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.open-table-checkbox {
+  width: auto;
+  min-width: 16px;
+  height: 16px;
 }
 
 .targets-table {

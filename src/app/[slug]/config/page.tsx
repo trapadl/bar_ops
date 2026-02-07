@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, SetStateAction, useMemo, useState } from "react";
+import { Fragment, SetStateAction, useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { DAY_KEYS, DAY_LABELS, cloneConfig, DEFAULT_CONFIG } from "@/lib/config";
 import { AppConfig, DayKey } from "@/lib/types";
@@ -19,23 +19,17 @@ function areConfigsEqual(left: AppConfig, right: AppConfig): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function parseLabelListInput(value: string): string[] {
-  const unique = new Set<string>();
-  const parts = value.split(/\r?\n|,/g);
+interface OpenTableOption {
+  label: string;
+  orderCount: number;
+  totalCents: number;
+}
 
-  for (const part of parts) {
-    const cleaned = part.trim().toLowerCase();
-    if (!cleaned) {
-      continue;
-    }
-
-    unique.add(cleaned);
-    if (unique.size >= 20) {
-      break;
-    }
-  }
-
-  return Array.from(unique);
+interface OpenTablesErrorState {
+  status: number;
+  message: string;
+  debugCode: string | null;
+  missing: string[];
 }
 
 interface ConfigEditorProps {
@@ -53,6 +47,11 @@ function ConfigEditor({
 }: ConfigEditorProps): React.JSX.Element {
   const [draftConfig, setDraftConfig] = useState<AppConfig>(() => cloneConfig(config));
   const [saveMessage, setSaveMessage] = useState<string>("");
+  const [openTableOptions, setOpenTableOptions] = useState<OpenTableOption[]>([]);
+  const [openTablesLoading, setOpenTablesLoading] = useState<boolean>(false);
+  const [openTablesError, setOpenTablesError] = useState<OpenTablesErrorState | null>(
+    null,
+  );
 
   const isDirty = useMemo(
     () => !areConfigsEqual(draftConfig, config),
@@ -62,6 +61,161 @@ function ConfigEditor({
   const updateDraft = (updater: (current: AppConfig) => AppConfig): void => {
     setDraftConfig((previous) => updater(cloneConfig(previous)));
     setSaveMessage("");
+  };
+
+  const loadOpenTableOptions = useCallback(async (): Promise<void> => {
+    setOpenTablesLoading(true);
+
+    try {
+      const response = await fetch("/api/open-tables", {
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+
+      const payload = (await response.json()) as unknown;
+
+      if (!response.ok) {
+        const objectPayload =
+          payload && typeof payload === "object"
+            ? (payload as {
+                error?: unknown;
+                message?: unknown;
+                debugCode?: unknown;
+                missing?: unknown;
+              })
+            : null;
+
+        const message =
+          typeof objectPayload?.message === "string"
+            ? objectPayload.message
+            : typeof objectPayload?.error === "string"
+              ? objectPayload.error
+              : "Open-table discovery failed.";
+
+        const missing = Array.isArray(objectPayload?.missing)
+          ? objectPayload.missing.filter((entry): entry is string => typeof entry === "string")
+          : [];
+
+        setOpenTablesError({
+          status: response.status,
+          message,
+          debugCode:
+            typeof objectPayload?.debugCode === "string"
+              ? objectPayload.debugCode
+              : null,
+          missing,
+        });
+        setOpenTableOptions([]);
+        return;
+      }
+
+      const objectPayload =
+        payload && typeof payload === "object"
+          ? (payload as { openTables?: unknown })
+          : null;
+
+      const openTables = Array.isArray(objectPayload?.openTables)
+        ? objectPayload.openTables
+        : [];
+
+      const normalizedOptions = openTables
+        .map((entry) => {
+          const objectEntry =
+            entry && typeof entry === "object"
+              ? (entry as {
+                  label?: unknown;
+                  orderCount?: unknown;
+                  totalCents?: unknown;
+                })
+              : null;
+
+          if (!objectEntry || typeof objectEntry.label !== "string") {
+            return null;
+          }
+
+          const label = objectEntry.label.trim().toLowerCase();
+          if (!label) {
+            return null;
+          }
+
+          return {
+            label,
+            orderCount:
+              typeof objectEntry.orderCount === "number"
+                ? Math.max(1, Math.round(objectEntry.orderCount))
+                : 1,
+            totalCents:
+              typeof objectEntry.totalCents === "number"
+                ? Math.max(0, Math.round(objectEntry.totalCents))
+                : 0,
+          };
+        })
+        .filter((entry): entry is OpenTableOption => entry !== null)
+        .sort((left, right) => left.label.localeCompare(right.label));
+
+      setOpenTableOptions(normalizedOptions);
+      setOpenTablesError(null);
+    } catch {
+      setOpenTablesError({
+        status: 0,
+        message: "Unable to load open tables from Square.",
+        debugCode: "CLIENT-NETWORK",
+        missing: [],
+      });
+      setOpenTableOptions([]);
+    } finally {
+      setOpenTablesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadOpenTableOptions();
+  }, [loadOpenTableOptions]);
+
+  const openTableOptionByLabel = useMemo(() => {
+    const map = new Map<string, OpenTableOption>();
+    for (const option of openTableOptions) {
+      map.set(option.label, option);
+    }
+    return map;
+  }, [openTableOptions]);
+
+  const selectableExcludedLabels = useMemo(() => {
+    const labels = new Set<string>();
+
+    for (const label of draftConfig.excludedOpenOrderLabels) {
+      const cleaned = label.trim().toLowerCase();
+      if (cleaned) {
+        labels.add(cleaned);
+      }
+    }
+
+    for (const option of openTableOptions) {
+      labels.add(option.label);
+    }
+
+    return Array.from(labels).sort((left, right) => left.localeCompare(right));
+  }, [draftConfig.excludedOpenOrderLabels, openTableOptions]);
+
+  const toggleExcludedLabel = (label: string, checked: boolean): void => {
+    updateDraft((previous) => {
+      const next = new Set(previous.excludedOpenOrderLabels.map((item) => item.toLowerCase()));
+
+      if (checked) {
+        next.add(label);
+      } else {
+        next.delete(label);
+      }
+
+      return {
+        ...previous,
+        excludedOpenOrderLabels: Array.from(next).sort((left, right) =>
+          left.localeCompare(right),
+        ),
+      };
+    });
   };
 
   const saveChanges = (): void => {
@@ -164,17 +318,69 @@ function ConfigEditor({
 
           <label className="field">
             <span>Excluded Debtor/Open Table Labels</span>
-            <textarea
-              rows={4}
-              value={draftConfig.excludedOpenOrderLabels.join("\n")}
-              onChange={(event) =>
-                updateDraft((previous) => ({
-                  ...previous,
-                  excludedOpenOrderLabels: parseLabelListInput(event.target.value),
-                }))
-              }
-              placeholder={"walkouts\nwastage\nmanagers"}
-            />
+            <p className="muted">
+              Select currently open tables to exclude carryover from adjusted revenue and
+              projection math.
+            </p>
+            <div className="actions">
+              <button
+                className="button-secondary"
+                type="button"
+                onClick={() => void loadOpenTableOptions()}
+                disabled={openTablesLoading}
+              >
+                {openTablesLoading ? "Refreshing..." : "Refresh Open Tables"}
+              </button>
+              <button
+                className="button-secondary"
+                type="button"
+                onClick={() =>
+                  updateDraft((previous) => ({
+                    ...previous,
+                    excludedOpenOrderLabels: [],
+                  }))
+                }
+                disabled={draftConfig.excludedOpenOrderLabels.length === 0}
+              >
+                Clear Exclusions
+              </button>
+            </div>
+            {openTablesError ? (
+              <p className="warn">
+                {openTablesError.message}{" "}
+                <code className="debug-code">{openTablesError.debugCode ?? "N/A"}</code>
+              </p>
+            ) : null}
+            {openTablesError && openTablesError.missing.length > 0 ? (
+              <p className="muted">Missing: {openTablesError.missing.join(", ")}</p>
+            ) : null}
+            <div className="open-table-picker" role="group" aria-label="Excluded open tables">
+              {selectableExcludedLabels.length === 0 ? (
+                <p className="muted">No currently open tables found.</p>
+              ) : (
+                selectableExcludedLabels.map((label) => {
+                  const isChecked = draftConfig.excludedOpenOrderLabels.includes(label);
+                  const option = openTableOptionByLabel.get(label);
+
+                  return (
+                    <label key={label} className="open-table-option">
+                      <input
+                        className="open-table-checkbox"
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={(event) => toggleExcludedLabel(label, event.target.checked)}
+                      />
+                      <span>
+                        {label}
+                        {option
+                          ? ` (${option.orderCount} open, $${(option.totalCents / 100).toFixed(2)})`
+                          : " (saved, not currently open)"}
+                      </span>
+                    </label>
+                  );
+                })
+              )}
+            </div>
           </label>
         </div>
       </article>

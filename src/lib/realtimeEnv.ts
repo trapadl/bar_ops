@@ -13,6 +13,13 @@ interface RealtimeEnvConfigResult {
   missing: string[];
 }
 
+interface SquareRuntimeConfigResult {
+  environment: SquareEnvironment;
+  accessToken: string;
+  locationId: string;
+  missing: string[];
+}
+
 function getFirstSetEnv(keys: readonly string[]): string {
   for (const key of keys) {
     const value = process.env[key];
@@ -42,19 +49,32 @@ function resolveSquareEnvironment(): SquareEnvironment {
   return raw === "sandbox" ? "sandbox" : "production";
 }
 
+export function resolveSquareRuntimeConfig(): SquareRuntimeConfigResult {
+  const accessToken = getFirstSetEnv(ENV_KEYS.squareAccessToken);
+  const locationId = getFirstSetEnv(ENV_KEYS.squareLocationId);
+  const missing: string[] = [];
+
+  if (!accessToken) {
+    missing.push(ENV_KEYS.squareAccessToken[0]);
+  }
+  if (!locationId) {
+    missing.push(ENV_KEYS.squareLocationId[0]);
+  }
+
+  return {
+    environment: resolveSquareEnvironment(),
+    accessToken,
+    locationId,
+    missing,
+  };
+}
+
 export function withRealtimeEnvConfig(baseConfig: AppConfig): RealtimeEnvConfigResult {
-  const squareAccessToken = getFirstSetEnv(ENV_KEYS.squareAccessToken);
-  const squareLocationId = getFirstSetEnv(ENV_KEYS.squareLocationId);
+  const squareRuntime = resolveSquareRuntimeConfig();
   const deputyAccessToken = getFirstSetEnv(ENV_KEYS.deputyAccessToken);
   const deputyBaseUrl = sanitizeOrigin(getFirstSetEnv(ENV_KEYS.deputyBaseUrl));
 
-  const missing: string[] = [];
-  if (!squareAccessToken) {
-    missing.push(ENV_KEYS.squareAccessToken[0]);
-  }
-  if (!squareLocationId) {
-    missing.push(ENV_KEYS.squareLocationId[0]);
-  }
+  const missing: string[] = [...squareRuntime.missing];
   if (!deputyAccessToken) {
     missing.push(ENV_KEYS.deputyAccessToken[0]);
   }
@@ -66,9 +86,9 @@ export function withRealtimeEnvConfig(baseConfig: AppConfig): RealtimeEnvConfigR
     config: {
       ...baseConfig,
       square: {
-        environment: resolveSquareEnvironment(),
-        accessToken: squareAccessToken,
-        locationId: squareLocationId,
+        environment: squareRuntime.environment,
+        accessToken: squareRuntime.accessToken,
+        locationId: squareRuntime.locationId,
       },
       deputy: {
         accessToken: deputyAccessToken,
@@ -78,4 +98,3 @@ export function withRealtimeEnvConfig(baseConfig: AppConfig): RealtimeEnvConfigR
     missing,
   };
 }
-

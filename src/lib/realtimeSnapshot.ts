@@ -34,6 +34,9 @@ interface IntegrationSummary {
   counts: {
     squarePayments: number;
     squareOpenOrders: number;
+    squareOpenOrdersExcluded: number;
+    squareOpenOrdersExcludedCarryoverCents: number;
+    squareOpenOrdersExcludedDeltaCents: number;
     deputyTimesheets: number;
     deputyEmployees: number;
   };
@@ -67,6 +70,9 @@ interface SquarePayment {
 }
 
 interface SquareOrder {
+  id: string | null;
+  label: string | null;
+  createdAt: Date | null;
   amountCents: number;
 }
 
@@ -76,6 +82,16 @@ interface DeputyTimesheet {
   employeeId: number | null;
   hourlyRate: number | null;
 }
+
+interface ExcludedOpenOrderBaselineEntry {
+  baselineCents: number;
+  capturedAtIso: string;
+}
+
+const excludedOpenOrderBaselineByServiceDay = new Map<
+  string,
+  ExcludedOpenOrderBaselineEntry
+>();
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -245,6 +261,105 @@ function parseDateValue(value: unknown): Date | null {
   }
 
   return null;
+}
+
+function normalizeLabel(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function pickOrderLabel(order: Record<string, unknown>): string | null {
+  const directCandidates = [
+    order.ticket_name,
+    order.reference_id,
+    order.customer_note,
+    order.name,
+  ];
+
+  for (const candidate of directCandidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  const metadata = order.metadata as Record<string, unknown> | undefined;
+  if (metadata) {
+    const metadataCandidates = [
+      metadata.table,
+      metadata.tab,
+      metadata.order_name,
+      metadata.label,
+    ];
+    for (const candidate of metadataCandidates) {
+      if (typeof candidate === "string" && candidate.trim().length > 0) {
+        return candidate.trim();
+      }
+    }
+  }
+
+  const source = order.source as Record<string, unknown> | undefined;
+  if (source && typeof source.name === "string" && source.name.trim().length > 0) {
+    return source.name.trim();
+  }
+
+  return null;
+}
+
+function matchesAnyExcludedLabel(
+  label: string | null,
+  excludedLabels: string[],
+): boolean {
+  if (!label) {
+    return false;
+  }
+
+  const normalizedLabel = normalizeLabel(label);
+  if (!normalizedLabel) {
+    return false;
+  }
+
+  return excludedLabels.some((excluded) => normalizedLabel.includes(excluded));
+}
+
+function buildExcludedServiceDayKey(
+  config: AppConfig,
+  windowStartMs: number,
+  excludedLabels: string[],
+): string {
+  const labelsKey = [...excludedLabels].sort().join("|");
+  return `${config.square.locationId}|${windowStartMs}|${labelsKey}`;
+}
+
+function getExcludedCarryoverBaselineCents(
+  config: AppConfig,
+  windowStartMs: number,
+  excludedLabels: string[],
+  currentExcludedTotalCents: number,
+): number {
+  if (excludedLabels.length === 0) {
+    return 0;
+  }
+
+  const key = buildExcludedServiceDayKey(config, windowStartMs, excludedLabels);
+  const existing = excludedOpenOrderBaselineByServiceDay.get(key);
+  if (existing) {
+    return existing.baselineCents;
+  }
+
+  if (excludedOpenOrderBaselineByServiceDay.size > 200) {
+    const oldestKey = excludedOpenOrderBaselineByServiceDay.keys().next().value as
+      | string
+      | undefined;
+    if (oldestKey) {
+      excludedOpenOrderBaselineByServiceDay.delete(oldestKey);
+    }
+  }
+
+  excludedOpenOrderBaselineByServiceDay.set(key, {
+    baselineCents: Math.max(0, currentExcludedTotalCents),
+    capturedAtIso: new Date().toISOString(),
+  });
+
+  return Math.max(0, currentExcludedTotalCents);
 }
 
 async function fetchSquarePayments(
@@ -420,20 +535,36 @@ function extractSquareOpenOrders(rawOrders: unknown[]): SquareOrder[] {
 
   for (const raw of rawOrders) {
     const order = raw as {
+      id?: unknown;
+      created_at?: unknown;
       total_money?: { amount?: unknown };
       net_amounts?: { total_money?: { amount?: unknown } };
+      ticket_name?: unknown;
+      reference_id?: unknown;
+      customer_note?: unknown;
+      metadata?: Record<string, unknown>;
+      source?: Record<string, unknown>;
       line_items?: Array<{
         quantity?: unknown;
         base_price_money?: { amount?: unknown };
       }>;
     };
 
+    const orderId = typeof order.id === "string" ? order.id : null;
+    const createdAt = parseDateValue(order.created_at);
+    const label = pickOrderLabel(order as unknown as Record<string, unknown>);
+
     const directAmount =
       parseNumber(order.total_money?.amount) ??
       parseNumber(order.net_amounts?.total_money?.amount);
 
     if (directAmount !== null) {
-      rows.push({ amountCents: Math.max(0, Math.round(directAmount)) });
+      rows.push({
+        id: orderId,
+        label,
+        createdAt,
+        amountCents: Math.max(0, Math.round(directAmount)),
+      });
       continue;
     }
 
@@ -445,7 +576,12 @@ function extractSquareOpenOrders(rawOrders: unknown[]): SquareOrder[] {
       derivedAmount += base * quantity;
     }
 
-    rows.push({ amountCents: Math.max(0, Math.round(derivedAmount)) });
+    rows.push({
+      id: orderId,
+      label,
+      createdAt,
+      amountCents: Math.max(0, Math.round(derivedAmount)),
+    });
   }
 
   return rows;
@@ -727,6 +863,9 @@ export async function buildRealtimeSnapshot(
         counts: {
           squarePayments: 0,
           squareOpenOrders: 0,
+          squareOpenOrdersExcluded: 0,
+          squareOpenOrdersExcludedCarryoverCents: 0,
+          squareOpenOrdersExcludedDeltaCents: 0,
           deputyTimesheets: 0,
           deputyEmployees: 0,
         },
@@ -825,10 +964,54 @@ export async function buildRealtimeSnapshot(
     effectiveNowMs,
     bucketCount,
   );
-  const openBillsCents = openOrders.reduce(
+
+  const excludedOpenOrderLabels = Array.from(
+    new Set(
+      config.excludedOpenOrderLabels
+        .map((label) => normalizeLabel(label))
+        .filter((label) => label.length > 0),
+    ),
+  );
+
+  const excludedOpenOrders = openOrders.filter((order) =>
+    matchesAnyExcludedLabel(order.label, excludedOpenOrderLabels),
+  );
+  const includedOpenOrders = openOrders.filter(
+    (order) => !matchesAnyExcludedLabel(order.label, excludedOpenOrderLabels),
+  );
+
+  const includedOpenBillsCents = includedOpenOrders.reduce(
     (sum, order) => sum + Math.max(0, order.amountCents),
     0,
   );
+  const excludedOpenOrdersTotalCents = excludedOpenOrders.reduce(
+    (sum, order) => sum + Math.max(0, order.amountCents),
+    0,
+  );
+
+  const excludedCarryoverBaselineCents = getExcludedCarryoverBaselineCents(
+    config,
+    windowStartMs,
+    excludedOpenOrderLabels,
+    excludedOpenOrdersTotalCents,
+  );
+  const excludedOpenOrdersDeltaCents = Math.max(
+    0,
+    excludedOpenOrdersTotalCents - excludedCarryoverBaselineCents,
+  );
+
+  const openBillsCents = includedOpenBillsCents + excludedOpenOrdersDeltaCents;
+
+  log("realtime", "Open order filtering", {
+    totalOpenOrderCount: openOrders.length,
+    includedOpenOrderCount: includedOpenOrders.length,
+    excludedOpenOrderCount: excludedOpenOrders.length,
+    includedOpenBillsCents,
+    excludedOpenOrdersTotalCents,
+    excludedCarryoverBaselineCents,
+    excludedOpenOrdersDeltaCents,
+    excludedOpenOrderLabels,
+  });
 
   const laborByBucket = Array.from({ length: bucketCount }, () => 0);
   for (const timesheet of timesheets) {
@@ -981,6 +1164,9 @@ export async function buildRealtimeSnapshot(
     counts: {
       squarePayments: payments.length,
       squareOpenOrders: openOrders.length,
+      squareOpenOrdersExcluded: excludedOpenOrders.length,
+      squareOpenOrdersExcludedCarryoverCents: excludedCarryoverBaselineCents,
+      squareOpenOrdersExcludedDeltaCents: excludedOpenOrdersDeltaCents,
       deputyTimesheets: timesheets.length,
       deputyEmployees: employeeRates.size,
     },

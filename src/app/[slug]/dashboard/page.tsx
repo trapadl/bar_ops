@@ -304,6 +304,10 @@ export default function DashboardPage(): React.JSX.Element {
   const targetRevenueCents = config.dailyTargets[snapshot.dayKey].revenueTargetCents;
   const targetWagePercent = config.dailyTargets[snapshot.dayKey].wageTargetPercent;
   const operatingHours = getOperatingHoursForDay(config, snapshot.dayKey);
+  const excludedLabelSummary =
+    config.excludedOpenOrderLabels.length > 0
+      ? config.excludedOpenOrderLabels.join(", ")
+      : "none";
 
   const revenueScaleMax = Math.max(
     1,
@@ -382,7 +386,8 @@ export default function DashboardPage(): React.JSX.Element {
             </button>
           </div>
           <p className="muted endpoint-line">
-            Realtime credentials are loaded from server environment variables.
+            Realtime credentials are loaded from server environment variables. Excluded
+            open-table carryover labels: {excludedLabelSummary}.
           </p>
           {dataError ? (
             <p className="warn">

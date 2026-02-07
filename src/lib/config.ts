@@ -60,6 +60,8 @@ const DEFAULT_DEPUTY_CONFIG: DeputyAccessConfig = {
   baseUrl: "",
 };
 
+const DEFAULT_EXCLUDED_OPEN_ORDER_LABELS = ["walkouts", "wastage", "managers"];
+
 export const DEFAULT_CONFIG: AppConfig = {
   storeName: "BarOps Adelaide",
   timezone: "Australia/Adelaide",
@@ -69,6 +71,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   averageBillLengthMinutes: 55,
   averageHourlyRate: 32,
   refreshIntervalSeconds: 60,
+  excludedOpenOrderLabels: [...DEFAULT_EXCLUDED_OPEN_ORDER_LABELS],
   dataSourceMode: "sample",
   square: { ...DEFAULT_SQUARE_CONFIG },
   deputy: { ...DEFAULT_DEPUTY_CONFIG },
@@ -105,6 +108,36 @@ function cloneOperatingHours(
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function sanitizeExcludedOpenOrderLabels(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [...DEFAULT_EXCLUDED_OPEN_ORDER_LABELS];
+  }
+
+  const unique = new Set<string>();
+
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+
+    const cleaned = item.trim().toLowerCase();
+    if (!cleaned) {
+      continue;
+    }
+
+    unique.add(cleaned);
+    if (unique.size >= 20) {
+      break;
+    }
+  }
+
+  if (unique.size === 0) {
+    return [...DEFAULT_EXCLUDED_OPEN_ORDER_LABELS];
+  }
+
+  return Array.from(unique);
 }
 
 function sanitizeClock(value: unknown, fallback: string): string {
@@ -283,6 +316,9 @@ export function sanitizeConfig(input: Partial<AppConfig> | null | undefined): Ap
         900,
       ),
     ),
+    excludedOpenOrderLabels: sanitizeExcludedOpenOrderLabels(
+      source.excludedOpenOrderLabels,
+    ),
     dataSourceMode: sanitizeDataSourceMode(source.dataSourceMode),
     square: sanitizeSquareConfig(source.square),
     deputy: sanitizeDeputyConfig(source.deputy),
@@ -358,6 +394,7 @@ export function cloneConfig(config: AppConfig): AppConfig {
   return {
     ...config,
     dailyOperatingHours: cloneOperatingHours(config.dailyOperatingHours),
+    excludedOpenOrderLabels: [...config.excludedOpenOrderLabels],
     square: { ...config.square },
     deputy: { ...config.deputy },
     dailyTargets: cloneTargets(config.dailyTargets),

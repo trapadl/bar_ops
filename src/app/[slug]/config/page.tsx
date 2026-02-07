@@ -19,6 +19,25 @@ function areConfigsEqual(left: AppConfig, right: AppConfig): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function parseLabelListInput(value: string): string[] {
+  const unique = new Set<string>();
+  const parts = value.split(/\r?\n|,/g);
+
+  for (const part of parts) {
+    const cleaned = part.trim().toLowerCase();
+    if (!cleaned) {
+      continue;
+    }
+
+    unique.add(cleaned);
+    if (unique.size >= 20) {
+      break;
+    }
+  }
+
+  return Array.from(unique);
+}
+
 interface ConfigEditorProps {
   slug: string;
   config: AppConfig;
@@ -140,6 +159,21 @@ function ConfigEditor({
                   averageHourlyRate: toPositiveNumber(event.target.value, 5),
                 }))
               }
+            />
+          </label>
+
+          <label className="field">
+            <span>Excluded Debtor/Open Table Labels</span>
+            <textarea
+              rows={4}
+              value={draftConfig.excludedOpenOrderLabels.join("\n")}
+              onChange={(event) =>
+                updateDraft((previous) => ({
+                  ...previous,
+                  excludedOpenOrderLabels: parseLabelListInput(event.target.value),
+                }))
+              }
+              placeholder={"walkouts\nwastage\nmanagers"}
             />
           </label>
         </div>

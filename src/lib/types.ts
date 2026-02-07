@@ -42,6 +42,7 @@ export interface AppConfig {
   averageBillLengthMinutes: number;
   averageHourlyRate: number;
   refreshIntervalSeconds: number;
+  excludedOpenOrderLabels: string[];
   dataSourceMode: DataSourceMode;
   square: SquareAccessConfig;
   deputy: DeputyAccessConfig;

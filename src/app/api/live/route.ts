@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { sanitizeConfig } from "@/lib/config";
 import { buildLiveSnapshot } from "@/lib/mockData";
+import { withRealtimeEnvConfig } from "@/lib/realtimeEnv";
 import { buildRealtimeSnapshot } from "@/lib/realtimeSnapshot";
 import { getServerConfig } from "@/lib/serverConfigStore";
 import { AppConfig } from "@/lib/types";
@@ -72,23 +73,6 @@ function buildDebugCode(prefix: string): string {
   return `${prefix}-${stamp}-${random}`;
 }
 
-function validateRealtimeConfig(config: ReturnType<typeof getServerConfig>): string[] {
-  const missing: string[] = [];
-  if (!config.square.accessToken) {
-    missing.push("square.accessToken");
-  }
-  if (!config.square.locationId) {
-    missing.push("square.locationId");
-  }
-  if (!config.deputy.accessToken) {
-    missing.push("deputy.accessToken");
-  }
-  if (!config.deputy.baseUrl) {
-    missing.push("deputy.baseUrl");
-  }
-  return missing;
-}
-
 interface LiveRequestOptions {
   config: AppConfig;
   referenceDate: Date;
@@ -102,15 +86,18 @@ async function handleLiveRequest({
 }: LiveRequestOptions): Promise<NextResponse> {
 
   if (source === "realtime") {
-    const missing = validateRealtimeConfig(config);
-    if (missing.length > 0) {
+    const realtimeContext = withRealtimeEnvConfig(config);
+    if (realtimeContext.missing.length > 0) {
       const debugCode = buildDebugCode("CFG");
-      logInternal("live", "Realtime config missing", { debugCode, missing });
+      logInternal("live", "Realtime env config missing", {
+        debugCode,
+        missing: realtimeContext.missing,
+      });
       return NextResponse.json(
         {
-          error: "Missing realtime integration settings",
-          message: "Square/Deputy realtime config is incomplete.",
-          missing,
+          error: "Missing realtime integration environment settings",
+          message: "Square/Deputy realtime environment config is incomplete.",
+          missing: realtimeContext.missing,
           debugCode,
         },
         { status: 400 },
@@ -118,7 +105,11 @@ async function handleLiveRequest({
     }
 
     try {
-      const realtime = await buildRealtimeSnapshot(config, referenceDate, logInternal);
+      const realtime = await buildRealtimeSnapshot(
+        realtimeContext.config,
+        referenceDate,
+        logInternal,
+      );
       return NextResponse.json({
         ...realtime.snapshot,
         _integration: realtime.integration,

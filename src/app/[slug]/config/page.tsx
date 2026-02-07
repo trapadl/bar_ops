@@ -146,102 +146,14 @@ function ConfigEditor({
       </article>
 
       <article className="card">
-        <h2 className="card-title">Square + Deputy Access</h2>
+        <h2 className="card-title">Realtime Integrations</h2>
         <p className="muted">
-          These credentials are used when dashboard mode is set to Realtime.
+          Square and Deputy credentials are server-only. Set them in environment
+          variables (local <code>.env.local</code> or Vercel Project Settings). They are
+          never saved in browser storage.
         </p>
 
         <div className="form-grid">
-          <label className="field">
-            <span>Square Environment</span>
-            <select
-              value={draftConfig.square.environment}
-              onChange={(event) =>
-                updateDraft((previous) => ({
-                  ...previous,
-                  square: {
-                    ...previous.square,
-                    environment:
-                      event.target.value === "sandbox" ? "sandbox" : "production",
-                  },
-                }))
-              }
-            >
-              <option value="production">Production</option>
-              <option value="sandbox">Sandbox</option>
-            </select>
-          </label>
-
-          <label className="field">
-            <span>Square Access Token</span>
-            <input
-              type="password"
-              value={draftConfig.square.accessToken}
-              onChange={(event) =>
-                updateDraft((previous) => ({
-                  ...previous,
-                  square: {
-                    ...previous.square,
-                    accessToken: event.target.value,
-                  },
-                }))
-              }
-              placeholder="EAAA..."
-            />
-          </label>
-
-          <label className="field">
-            <span>Square Location ID</span>
-            <input
-              value={draftConfig.square.locationId}
-              onChange={(event) =>
-                updateDraft((previous) => ({
-                  ...previous,
-                  square: {
-                    ...previous.square,
-                    locationId: event.target.value,
-                  },
-                }))
-              }
-              placeholder="L1234567890ABC"
-            />
-          </label>
-
-          <label className="field">
-            <span>Deputy Application Access Token</span>
-            <input
-              type="password"
-              value={draftConfig.deputy.accessToken}
-              onChange={(event) =>
-                updateDraft((previous) => ({
-                  ...previous,
-                  deputy: {
-                    ...previous.deputy,
-                    accessToken: event.target.value,
-                  },
-                }))
-              }
-              placeholder="Deputy token"
-            />
-          </label>
-
-          <label className="field">
-            <span>Deputy Base URL</span>
-            <input
-              value={draftConfig.deputy.baseUrl}
-              onChange={(event) =>
-                updateDraft((previous) => ({
-                  ...previous,
-                  deputy: {
-                    ...previous.deputy,
-                    baseUrl: event.target.value,
-                  },
-                }))
-              }
-              placeholder="https://your-company.as.deputy.com"
-            />
-          </label>
-
           <div className="field">
             <span>Default Dashboard Source</span>
             <div className="source-toggle" role="group" aria-label="Default data source">
@@ -271,6 +183,22 @@ function ConfigEditor({
               </button>
             </div>
           </div>
+
+          <div className="field">
+            <span>Required Environment Variables</span>
+            <p className="muted">
+              <code>SQUARE_ACCESS_TOKEN</code>
+              <br />
+              <code>SQUARE_LOCATION_ID</code>
+              <br />
+              <code>DEPUTY_ACCESS_TOKEN</code>
+              <br />
+              <code>DEPUTY_BASE_URL</code>
+              <br />
+              <code>SQUARE_ENVIRONMENT</code> (optional: <code>production</code> or{" "}
+              <code>sandbox</code>)
+            </p>
+          </div>
         </div>
 
         <div className="api-help">
@@ -294,6 +222,14 @@ function ConfigEditor({
             >
               developer.deputy.com/docs/getting-started-with-the-deputy-api
             </a>
+          </p>
+          <p className="muted">
+            Square needs a Location ID (for example, <code>L...</code>) and not the
+            Square Application ID (<code>sq0idp-...</code>).
+          </p>
+          <p className="muted">
+            Deputy base URL should be the account origin only (for example,{" "}
+            <code>https://your-company.au.deputy.com</code>).
           </p>
         </div>
       </article>

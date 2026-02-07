@@ -49,6 +49,8 @@ function ensureClientInitialized(): void {
   clientInitialized = true;
   const loaded = loadConfigFromStorage();
   setClientSnapshot(loaded);
+  // Persist sanitized config immediately so any legacy secret fields are removed.
+  saveConfigToStorage(loaded);
   void pushConfigToServer(loaded);
 }
 

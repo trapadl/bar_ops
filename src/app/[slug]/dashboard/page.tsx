@@ -304,10 +304,6 @@ export default function DashboardPage(): React.JSX.Element {
   const targetRevenueCents = config.dailyTargets[snapshot.dayKey].revenueTargetCents;
   const targetWagePercent = config.dailyTargets[snapshot.dayKey].wageTargetPercent;
   const operatingHours = getOperatingHoursForDay(config, snapshot.dayKey);
-  const squareConfigured =
-    config.square.accessToken.length > 0 && config.square.locationId.length > 0;
-  const deputyConfigured =
-    config.deputy.accessToken.length > 0 && config.deputy.baseUrl.length > 0;
 
   const revenueScaleMax = Math.max(
     1,
@@ -386,8 +382,7 @@ export default function DashboardPage(): React.JSX.Element {
             </button>
           </div>
           <p className="muted endpoint-line">
-            Square: {squareConfigured ? "Configured" : "Missing token/location"} | Deputy:{" "}
-            {deputyConfigured ? "Configured" : "Missing token/base URL"}
+            Realtime credentials are loaded from server environment variables.
           </p>
           {dataError ? (
             <p className="warn">

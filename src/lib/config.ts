@@ -171,37 +171,18 @@ function sanitizeSquareConfig(value: unknown): SquareAccessConfig {
 
   return {
     environment,
-    accessToken:
-      typeof source?.accessToken === "string" ? source.accessToken.trim() : "",
-    locationId:
-      typeof source?.locationId === "string" ? source.locationId.trim() : "",
+    // Secrets are server-managed via environment variables and never persisted client-side.
+    accessToken: "",
+    locationId: "",
   };
 }
 
-function sanitizeDeputyBaseUrl(value: unknown): string {
-  if (typeof value !== "string") {
-    return "";
-  }
-
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    return "";
-  }
-
-  try {
-    const parsed = new URL(trimmed);
-    return parsed.origin;
-  } catch {
-    return "";
-  }
-}
-
 function sanitizeDeputyConfig(value: unknown): DeputyAccessConfig {
-  const source = value as Partial<DeputyAccessConfig> | undefined;
+  void value;
   return {
-    accessToken:
-      typeof source?.accessToken === "string" ? source.accessToken.trim() : "",
-    baseUrl: sanitizeDeputyBaseUrl(source?.baseUrl),
+    // Secrets are server-managed via environment variables and never persisted client-side.
+    accessToken: "",
+    baseUrl: "",
   };
 }
 

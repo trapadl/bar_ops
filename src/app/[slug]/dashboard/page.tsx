@@ -451,10 +451,10 @@ export default function DashboardPage(): React.JSX.Element {
             <div className="bar-scale" style={{ width: `${contextBarScalePercent}%` }}>
               <div className="context-base">
                 <span className="marker marker-last" style={{ left: `${lastWeekMarkerPercent}%` }}>
-                  Last Week
+                  <span className="marker-label">Last Week</span>
                 </span>
                 <span className="marker marker-rolling" style={{ left: `${rollingMarkerPercent}%` }}>
-                  4W Avg
+                  <span className="marker-label">4W Avg</span>
                 </span>
               </div>
             </div>

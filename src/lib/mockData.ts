@@ -1,4 +1,14 @@
-import { AppConfig, ComparableNight, HistorySnapshot, LiveSnapshot, RevenueBucket } from "@/lib/types";
+import { DAY_KEYS } from "@/lib/config";
+import {
+  AppConfig,
+  ComparableNight,
+  DayKey,
+  HistorySnapshot,
+  LiveSnapshot,
+  PointOfNoReturnSnapshot,
+  RevenueBucket,
+  WeeklySnapshot,
+} from "@/lib/types";
 import { averageSeries, buildBaselineFractions, computeProjection, computeWageSeries, cumulative, getInterpolatedBaselineFractionAtElapsedMinutes, toPercent } from "@/lib/math";
 import {
   buildBucketLabels,
@@ -12,6 +22,7 @@ const REPORTING_WINDOW_OPENING = "05:00";
 const REPORTING_WINDOW_CLOSING = "05:00";
 
 const BUCKET_MINUTES = 15;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -109,6 +120,145 @@ function averageRevenue(nights: ComparableNight[]): number {
   return Math.round(
     nights.reduce((sum, night) => sum + night.totalRevenueCents, 0) / nights.length,
   );
+}
+
+function getDayIndex(dayKey: DayKey): number {
+  const index = DAY_KEYS.indexOf(dayKey);
+  return index >= 0 ? index : 0;
+}
+
+function getLastOpenDayKey(config: AppConfig): DayKey | null {
+  for (let index = DAY_KEYS.length - 1; index >= 0; index -= 1) {
+    const dayKey = DAY_KEYS[index];
+    if (!config.dailyOperatingHours[dayKey].isClosed) {
+      return dayKey;
+    }
+  }
+
+  return null;
+}
+
+function buildSampleWeeklySnapshot(
+  config: AppConfig,
+  dayKey: DayKey,
+  serviceReference: Date,
+  actualRevenueCents: number,
+  laborCostCents: number,
+): WeeklySnapshot {
+  const dayIndex = getDayIndex(dayKey);
+  const weekStartIso = new Date(
+    serviceReference.getTime() - dayIndex * MILLISECONDS_PER_DAY,
+  ).toISOString();
+  const dateKey = serviceReference.toISOString().slice(0, 10);
+  const seed = seedFromString(`${config.storeName}:${dateKey}:weekly`);
+
+  let priorRevenueCents = 0;
+  let priorWagesCents = 0;
+
+  for (let index = 0; index < dayIndex; index += 1) {
+    const priorDayKey = DAY_KEYS[index];
+    const target = config.dailyTargets[priorDayKey];
+    const revenueFactor = 0.84 + seededUnit(seed, 300 + index) * 0.32;
+    const dayRevenueCents = Math.round(target.revenueTargetCents * revenueFactor);
+    const wageFactor = 0.9 + seededUnit(seed, 500 + index) * 0.22;
+    const dayWagesCents = Math.round(
+      dayRevenueCents * (target.wageTargetPercent / 100) * wageFactor,
+    );
+
+    priorRevenueCents += dayRevenueCents;
+    priorWagesCents += dayWagesCents;
+  }
+
+  return {
+    weekStartIso,
+    revenueToDateCents: Math.max(0, priorRevenueCents + actualRevenueCents),
+    wagesToDateCents: Math.max(0, priorWagesCents + laborCostCents),
+  };
+}
+
+function buildSamplePointOfNoReturn(
+  config: AppConfig,
+  dayKey: DayKey,
+  now: Date,
+  projectedWeekWagePercentAtNow: number | null,
+): PointOfNoReturnSnapshot {
+  const targetWagePercent = config.weeklyPointOfNoReturnWagePercent;
+  const lastOpenDayKey = getLastOpenDayKey(config);
+
+  if (!lastOpenDayKey) {
+    return {
+      targetWagePercent,
+      status: "unavailable",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  if (dayKey !== lastOpenDayKey) {
+    return {
+      targetWagePercent,
+      status: "not_last_shift",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  if (projectedWeekWagePercentAtNow === null) {
+    return {
+      targetWagePercent,
+      status: "unavailable",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  const deltaPercent = projectedWeekWagePercentAtNow - targetWagePercent;
+  if (deltaPercent <= -1.2) {
+    return {
+      targetWagePercent,
+      status: "safe_all_shift",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  const minutesMagnitude = Math.max(
+    8,
+    Math.min(210, Math.round(Math.abs(deltaPercent) * 75)),
+  );
+  if (deltaPercent > 0) {
+    return {
+      targetWagePercent,
+      status: "passed",
+      pointTimeIso: new Date(now.getTime() - minutesMagnitude * 60_000).toISOString(),
+      minutesFromNow: -minutesMagnitude,
+      projectedWeekWagePercentAtNow,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  return {
+    targetWagePercent,
+    status: "upcoming",
+    pointTimeIso: new Date(now.getTime() + minutesMagnitude * 60_000).toISOString(),
+    minutesFromNow: minutesMagnitude,
+    projectedWeekWagePercentAtNow,
+    shiftStartIso: null,
+    shiftEndIso: null,
+  };
 }
 
 function buildHistoryModel(config: AppConfig, now: Date): HistorySnapshot {
@@ -294,9 +444,45 @@ export function buildLiveSnapshot(config: AppConfig, now = new Date()): LiveSnap
         100
       : 0;
 
+  const weekly = buildSampleWeeklySnapshot(
+    config,
+    history.dayKey,
+    serviceReference,
+    actualRevenueCents,
+    laborCostCents,
+  );
+  const remainingWindowMinutes = Math.max(0, operatingWindowMinutes - elapsedMinutes);
+  const projectedRemainingWagesCents = Math.round(
+    (remainingWindowMinutes / 60) * config.averageHourlyRate * 100,
+  );
+  const projectedRemainingRevenueCents = Math.max(
+    0,
+    projection.rampedProjectedTotalCents - adjustedRevenueCents,
+  );
+  const projectedWeekRevenueAtNow = Math.max(
+    0,
+    (weekly.revenueToDateCents ?? 0) + projectedRemainingRevenueCents,
+  );
+  const projectedWeekWagesAtNow = Math.max(
+    0,
+    (weekly.wagesToDateCents ?? 0) + projectedRemainingWagesCents,
+  );
+  const projectedWeekWagePercentAtNow = toPercent(
+    projectedWeekWagesAtNow,
+    projectedWeekRevenueAtNow,
+  );
+  const pointOfNoReturn = buildSamplePointOfNoReturn(
+    config,
+    history.dayKey,
+    now,
+    projectedWeekWagePercentAtNow,
+  );
+
   return {
     generatedAtIso: now.toISOString(),
     dayKey: history.dayKey,
+    weekly,
+    pointOfNoReturn,
     totals: {
       actualRevenueCents,
       openBillsCents,

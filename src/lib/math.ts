@@ -55,6 +55,34 @@ export function getBaselineFractionAtIndex(
   return clamp(baselineFractions[safeIndex], 0, 1);
 }
 
+export function getInterpolatedBaselineFractionAtElapsedMinutes(
+  baselineFractions: number[],
+  elapsedMinutes: number,
+  bucketMinutes: number,
+): number {
+  if (baselineFractions.length === 0) {
+    return 0.02;
+  }
+
+  if (!Number.isFinite(elapsedMinutes) || elapsedMinutes <= 0) {
+    return clamp(baselineFractions[0] ?? 0, 0, 1);
+  }
+
+  if (!Number.isFinite(bucketMinutes) || bucketMinutes <= 0) {
+    return getBaselineFractionAtIndex(baselineFractions, 0);
+  }
+
+  const maxIndex = baselineFractions.length - 1;
+  const bucketFloat = clamp(elapsedMinutes / bucketMinutes, 0, maxIndex);
+  const lowerIndex = Math.floor(bucketFloat);
+  const upperIndex = Math.min(maxIndex, lowerIndex + 1);
+  const alpha = bucketFloat - lowerIndex;
+  const lower = getBaselineFractionAtIndex(baselineFractions, lowerIndex);
+  const upper = getBaselineFractionAtIndex(baselineFractions, upperIndex);
+
+  return clamp(lower + (upper - lower) * alpha, 0, 1);
+}
+
 export function computeProjection(
   currentRevenueCents: number,
   baselineFractionAtNow: number,
@@ -69,7 +97,8 @@ export function computeProjection(
       ? Math.round(currentRevenueCents / guardedBaseline)
       : rollingAverageRevenueCents;
 
-  const rampWeight = clamp(elapsedFraction * 1.65, 0.1, 1);
+  const rampProgress = clamp(guardedBaseline, 0, 1);
+  const rampWeight = clamp(rampProgress * 1.65, 0.1, 1);
   const rampedProjectedTotalCents = Math.round(
     rawProjectedTotalCents * rampWeight +
       rollingAverageRevenueCents * (1 - rampWeight),

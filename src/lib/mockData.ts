@@ -1,5 +1,5 @@
 import { AppConfig, ComparableNight, HistorySnapshot, LiveSnapshot, RevenueBucket } from "@/lib/types";
-import { averageSeries, buildBaselineFractions, computeProjection, computeWageSeries, cumulative, getBaselineFractionAtIndex, toPercent } from "@/lib/math";
+import { averageSeries, buildBaselineFractions, computeProjection, computeWageSeries, cumulative, getInterpolatedBaselineFractionAtElapsedMinutes, toPercent } from "@/lib/math";
 import {
   buildBucketLabels,
   BUSINESS_DAY_START_HOUR,
@@ -254,9 +254,10 @@ export function buildLiveSnapshot(config: AppConfig, now = new Date()): LiveSnap
   const baselineFractions = buildBaselineFractions(
     history.comparableNights.map((night) => night.bucketRevenueCents),
   );
-  const baselineFractionAtNow = getBaselineFractionAtIndex(
+  const baselineFractionAtNow = getInterpolatedBaselineFractionAtElapsedMinutes(
     baselineFractions,
-    Math.max(0, completedBucketCount - 1),
+    elapsedMinutes,
+    BUCKET_MINUTES,
   );
   const projection = computeProjection(
     adjustedRevenueCents,

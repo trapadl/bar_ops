@@ -3,7 +3,7 @@ import {
   computeProjection,
   computeWageSeries,
   cumulative,
-  getBaselineFractionAtIndex,
+  getInterpolatedBaselineFractionAtElapsedMinutes,
   toPercent,
 } from "@/lib/math";
 import {
@@ -49,6 +49,12 @@ interface IntegrationSummary {
   counts: {
     squarePayments: number;
     squareWeekPayments: number;
+    squarePaymentsRefundEvents: number;
+    squareWeekPaymentsRefundEvents: number;
+    squarePaymentsTipsExcludedCents: number;
+    squareWeekPaymentsTipsExcludedCents: number;
+    squarePaymentsRefundsNetCents: number;
+    squareWeekPaymentsRefundsNetCents: number;
     squareOpenOrders: number;
     squareOpenOrdersExcluded: number;
     squareOpenOrdersExcludedCarryoverCents: number;
@@ -102,6 +108,18 @@ interface PointOfNoReturnInputs {
 interface SquarePayment {
   createdAt: Date;
   amountCents: number;
+}
+
+interface SquarePaymentExtraction {
+  rows: SquarePayment[];
+  counts: {
+    payments: number;
+    refundEvents: number;
+  };
+  amounts: {
+    tipsExcludedCents: number;
+    refundsNetCents: number;
+  };
 }
 
 interface SquareOrder {
@@ -698,14 +716,40 @@ async function fetchDeputyTimesheets(
   throw new Error(`Deputy timesheet query endpoints failed: ${queryErrors.join(", ")}`);
 }
 
-function extractSquarePayments(rawPayments: unknown[]): SquarePayment[] {
+function isCompletedSquareRefundStatus(value: unknown): boolean {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return true;
+  }
+
+  const normalized = value.trim().toUpperCase();
+  return ![
+    "PENDING",
+    "FAILED",
+    "REJECTED",
+    "CANCELED",
+    "CANCELLED",
+  ].includes(normalized);
+}
+
+function extractSquarePayments(rawPayments: unknown[]): SquarePaymentExtraction {
   const rows: SquarePayment[] = [];
+  let paymentCount = 0;
+  let refundEvents = 0;
+  let tipsExcludedCents = 0;
+  let refundsNetCents = 0;
 
   for (const raw of rawPayments) {
     const payment = raw as {
       created_at?: unknown;
       status?: unknown;
       amount_money?: { amount?: unknown };
+      tip_money?: { amount?: unknown };
+      refunded_money?: { amount?: unknown };
+      refunds?: Array<{
+        amount_money?: { amount?: unknown };
+        created_at?: unknown;
+        status?: unknown;
+      }>;
     };
 
     if (
@@ -716,18 +760,79 @@ function extractSquarePayments(rawPayments: unknown[]): SquarePayment[] {
     }
 
     const createdAt = parseDateValue(payment.created_at);
-    const amount = parseNumber(payment.amount_money?.amount);
-    if (!createdAt || amount === null) {
+    const grossAmount = parseNumber(payment.amount_money?.amount);
+    const tipAmount = parseNumber(payment.tip_money?.amount) ?? 0;
+
+    if (createdAt && grossAmount !== null) {
+      const roundedTipAmount = Math.max(0, Math.round(tipAmount));
+      const revenueAmountCents = Math.max(0, Math.round(grossAmount) - roundedTipAmount);
+      rows.push({
+        createdAt,
+        amountCents: revenueAmountCents,
+      });
+      tipsExcludedCents += roundedTipAmount;
+      paymentCount += 1;
+    }
+
+    const refunds = Array.isArray(payment.refunds) ? payment.refunds : [];
+    let recordedRefundFromArray = false;
+
+    for (const refund of refunds) {
+      if (!isCompletedSquareRefundStatus(refund.status)) {
+        continue;
+      }
+
+      const refundAmount = parseNumber(refund.amount_money?.amount);
+      if (refundAmount === null || refundAmount <= 0) {
+        continue;
+      }
+
+      const refundCreatedAt = parseDateValue(refund.created_at) ?? createdAt;
+      if (!refundCreatedAt) {
+        continue;
+      }
+
+      const refundCents = Math.round(Math.abs(refundAmount));
+      rows.push({
+        createdAt: refundCreatedAt,
+        amountCents: -refundCents,
+      });
+      refundsNetCents += refundCents;
+      refundEvents += 1;
+      recordedRefundFromArray = true;
+    }
+
+    if (recordedRefundFromArray) {
       continue;
     }
 
-    rows.push({
-      createdAt,
-      amountCents: Math.round(amount),
-    });
+    const fallbackRefundedAmount = parseNumber(payment.refunded_money?.amount);
+    if (
+      createdAt &&
+      fallbackRefundedAmount !== null &&
+      fallbackRefundedAmount > 0
+    ) {
+      const fallbackRefundCents = Math.round(Math.abs(fallbackRefundedAmount));
+      rows.push({
+        createdAt,
+        amountCents: -fallbackRefundCents,
+      });
+      refundsNetCents += fallbackRefundCents;
+      refundEvents += 1;
+    }
   }
 
-  return rows;
+  return {
+    rows,
+    counts: {
+      payments: paymentCount,
+      refundEvents,
+    },
+    amounts: {
+      tipsExcludedCents,
+      refundsNetCents,
+    },
+  };
 }
 
 function extractSquareOpenOrders(rawOrders: unknown[]): SquareOrder[] {
@@ -889,7 +994,7 @@ function bucketizeRevenue(
       continue;
     }
 
-    buckets[index] += Math.max(0, payment.amountCents);
+    buckets[index] += Math.round(payment.amountCents);
   }
 
   return buckets;
@@ -908,7 +1013,7 @@ function sumPaymentsInWindow(
       continue;
     }
 
-    total += Math.max(0, payment.amountCents);
+    total += Math.round(payment.amountCents);
   }
 
   return total;
@@ -1537,15 +1642,37 @@ export async function buildRealtimeSnapshot(
     log("realtime", "Deputy employees failed", deputyEmployeesResult.reason);
   }
 
-  const payments =
+  const paymentExtraction =
     squarePaymentsResult.status === "fulfilled"
       ? extractSquarePayments(squarePaymentsResult.value ?? [])
-      : [];
+      : {
+          rows: [],
+          counts: {
+            payments: 0,
+            refundEvents: 0,
+          },
+          amounts: {
+            tipsExcludedCents: 0,
+            refundsNetCents: 0,
+          },
+        };
 
-  const weekPayments =
+  const weekPaymentExtraction =
     squareWeekPaymentsResult.status === "fulfilled"
       ? extractSquarePayments(squareWeekPaymentsResult.value ?? [])
-      : [];
+      : {
+          rows: [],
+          counts: {
+            payments: 0,
+            refundEvents: 0,
+          },
+          amounts: {
+            tipsExcludedCents: 0,
+            refundsNetCents: 0,
+          },
+        };
+
+  const payments = paymentExtraction.rows;
 
   const openOrders =
     squareOpenOrdersResult.status === "fulfilled"
@@ -1667,7 +1794,11 @@ export async function buildRealtimeSnapshot(
   const wagePercent = toPercent(laborCostCents, adjustedRevenueCents);
   const weeklyRevenueToDateCents =
     squareWeekPaymentsResult.status === "fulfilled"
-      ? sumPaymentsInWindow(weekPayments, weekWindowStartMs, weekWindowEndMs)
+      ? sumPaymentsInWindow(
+          weekPaymentExtraction.rows,
+          weekWindowStartMs,
+          weekWindowEndMs,
+        )
       : null;
   const weeklyWagesToDateCents =
     deputyWeekTimesheetsResult.status === "fulfilled"
@@ -1706,9 +1837,9 @@ export async function buildRealtimeSnapshot(
     );
 
     if (historicalResult.status === "fulfilled") {
-      const rows = extractSquarePayments(historicalResult.value ?? []);
+      const extracted = extractSquarePayments(historicalResult.value ?? []);
       const bucketed = bucketizeRevenue(
-        rows,
+        extracted.rows,
         compareWindow.start.getTime(),
         compareWindow.end.getTime(),
         bucketCount,
@@ -1736,9 +1867,10 @@ export async function buildRealtimeSnapshot(
       : buildFallbackFractions(bucketCount),
     bucketCount,
   );
-  const baselineFractionAtNow = getBaselineFractionAtIndex(
+  const baselineFractionAtNow = getInterpolatedBaselineFractionAtElapsedMinutes(
     baselineFractions,
-    Math.max(0, completedBucketCount - 1),
+    elapsedMinutes,
+    BUCKET_MINUTES,
   );
 
   const projection = computeProjection(
@@ -1843,8 +1975,14 @@ export async function buildRealtimeSnapshot(
       historicalWeek4: historicalStatuses[3] ?? "skipped",
     },
     counts: {
-      squarePayments: payments.length,
-      squareWeekPayments: weekPayments.length,
+      squarePayments: paymentExtraction.counts.payments,
+      squareWeekPayments: weekPaymentExtraction.counts.payments,
+      squarePaymentsRefundEvents: paymentExtraction.counts.refundEvents,
+      squareWeekPaymentsRefundEvents: weekPaymentExtraction.counts.refundEvents,
+      squarePaymentsTipsExcludedCents: paymentExtraction.amounts.tipsExcludedCents,
+      squareWeekPaymentsTipsExcludedCents: weekPaymentExtraction.amounts.tipsExcludedCents,
+      squarePaymentsRefundsNetCents: paymentExtraction.amounts.refundsNetCents,
+      squareWeekPaymentsRefundsNetCents: weekPaymentExtraction.amounts.refundsNetCents,
       squareOpenOrders: openOrders.length,
       squareOpenOrdersExcluded: excludedOpenOrders.length,
       squareOpenOrdersExcludedCarryoverCents: excludedCarryoverBaselineCents,

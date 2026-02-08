@@ -32,6 +32,15 @@ interface OpenTablesErrorState {
   missing: string[];
 }
 
+const SAMPLE_DATA_PRESET_OPTIONS: Array<{
+  value: AppConfig["sampleDataPreset"];
+  label: string;
+}> = [
+  { value: "ponr_na", label: "PONR N/A" },
+  { value: "ponr_safe_all_shift", label: "PONR Safe All Shift" },
+  { value: "ponr_time_point", label: "PONR Time Point" },
+];
+
 interface ConfigEditorProps {
   slug: string;
   config: AppConfig;
@@ -429,6 +438,29 @@ function ConfigEditor({
               </button>
             </div>
           </div>
+
+          <label className="field">
+            <span>Sample Data Scenario</span>
+            <select
+              value={draftConfig.sampleDataPreset}
+              onChange={(event) =>
+                updateDraft((previous) => ({
+                  ...previous,
+                  sampleDataPreset: event.target.value as AppConfig["sampleDataPreset"],
+                }))
+              }
+            >
+              {SAMPLE_DATA_PRESET_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="muted">
+              Used only when source is set to Sample. This helps verify point-of-no-return
+              states.
+            </p>
+          </label>
 
           <div className="field">
             <span>Required Environment Variables</span>

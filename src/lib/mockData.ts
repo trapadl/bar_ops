@@ -183,6 +183,46 @@ function buildSamplePointOfNoReturn(
   projectedWeekWagePercentAtNow: number | null,
 ): PointOfNoReturnSnapshot {
   const targetWagePercent = config.weeklyPointOfNoReturnWagePercent;
+
+  if (config.sampleDataPreset === "ponr_na") {
+    return {
+      targetWagePercent,
+      status: "unavailable",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow: null,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  if (config.sampleDataPreset === "ponr_safe_all_shift") {
+    return {
+      targetWagePercent,
+      status: "safe_all_shift",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow:
+        projectedWeekWagePercentAtNow ?? targetWagePercent - 1.6,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
+  if (config.sampleDataPreset === "ponr_time_point") {
+    const minutesFromNow = 42;
+    return {
+      targetWagePercent,
+      status: "upcoming",
+      pointTimeIso: new Date(now.getTime() + minutesFromNow * 60_000).toISOString(),
+      minutesFromNow,
+      projectedWeekWagePercentAtNow:
+        projectedWeekWagePercentAtNow ?? targetWagePercent - 0.4,
+      shiftStartIso: null,
+      shiftEndIso: null,
+    };
+  }
+
   const lastOpenDayKey = getLastOpenDayKey(config);
 
   if (!lastOpenDayKey) {

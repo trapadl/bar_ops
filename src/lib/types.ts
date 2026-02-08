@@ -19,6 +19,7 @@ export interface OperatingHours {
 }
 
 export type DataSourceMode = "sample" | "realtime";
+export type SampleDataPreset = "ponr_na" | "ponr_safe_all_shift" | "ponr_time_point";
 
 export type SquareEnvironment = "production" | "sandbox";
 
@@ -45,6 +46,7 @@ export interface AppConfig {
   refreshIntervalSeconds: number;
   excludedOpenOrderLabels: string[];
   dataSourceMode: DataSourceMode;
+  sampleDataPreset: SampleDataPreset;
   square: SquareAccessConfig;
   deputy: DeputyAccessConfig;
   dailyTargets: Record<DayKey, DailyTarget>;

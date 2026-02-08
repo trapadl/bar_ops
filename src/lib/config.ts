@@ -3,6 +3,7 @@ import {
   DailyTarget,
   DayKey,
   OperatingHours,
+  SampleDataPreset,
   SquareAccessConfig,
   DeputyAccessConfig,
 } from "@/lib/types";
@@ -62,6 +63,7 @@ const DEFAULT_DEPUTY_CONFIG: DeputyAccessConfig = {
 
 const DEFAULT_EXCLUDED_OPEN_ORDER_LABELS = ["walkouts", "wastage", "managers"];
 const DEFAULT_WEEKLY_PNR_WAGE_PERCENT = 26;
+const DEFAULT_SAMPLE_DATA_PRESET: SampleDataPreset = "ponr_time_point";
 
 export const DEFAULT_CONFIG: AppConfig = {
   storeName: "BarOps Adelaide",
@@ -75,6 +77,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   refreshIntervalSeconds: 60,
   excludedOpenOrderLabels: [...DEFAULT_EXCLUDED_OPEN_ORDER_LABELS],
   dataSourceMode: "sample",
+  sampleDataPreset: DEFAULT_SAMPLE_DATA_PRESET,
   square: { ...DEFAULT_SQUARE_CONFIG },
   deputy: { ...DEFAULT_DEPUTY_CONFIG },
   dailyTargets: cloneTargets(DEFAULT_DAILY_TARGETS),
@@ -197,6 +200,14 @@ function sanitizeOperatingHours(
 
 function sanitizeDataSourceMode(value: unknown): AppConfig["dataSourceMode"] {
   return value === "realtime" ? "realtime" : "sample";
+}
+
+function sanitizeSampleDataPreset(value: unknown): AppConfig["sampleDataPreset"] {
+  if (value === "ponr_na" || value === "ponr_safe_all_shift" || value === "ponr_time_point") {
+    return value;
+  }
+
+  return DEFAULT_SAMPLE_DATA_PRESET;
 }
 
 function sanitizeSquareConfig(value: unknown): SquareAccessConfig {
@@ -330,6 +341,7 @@ export function sanitizeConfig(input: Partial<AppConfig> | null | undefined): Ap
       source.excludedOpenOrderLabels,
     ),
     dataSourceMode: sanitizeDataSourceMode(source.dataSourceMode),
+    sampleDataPreset: sanitizeSampleDataPreset(source.sampleDataPreset),
     square: sanitizeSquareConfig(source.square),
     deputy: sanitizeDeputyConfig(source.deputy),
     dailyTargets: {

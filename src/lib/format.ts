@@ -24,3 +24,13 @@ export function formatClockIso(iso: string, timeZone: string): string {
     hourCycle: "h23",
   }).format(date);
 }
+
+export function formatClockMinuteIso(iso: string, timeZone: string): string {
+  const date = new Date(iso);
+  return new Intl.DateTimeFormat("en-AU", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+}

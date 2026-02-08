@@ -1,14 +1,21 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { DAY_LABELS, getOperatingHoursForDay } from "@/lib/config";
-import { formatClockIso, formatCurrencyFromCents, formatPercent } from "@/lib/format";
+import { DAY_KEYS, DAY_LABELS, getOperatingHoursForDay } from "@/lib/config";
+import {
+  formatClockIso,
+  formatClockMinuteIso,
+  formatCurrencyFromCents,
+  formatPercent,
+} from "@/lib/format";
 import { buildLiveSnapshot } from "@/lib/mockData";
-import { LiveSnapshot } from "@/lib/types";
+import { DayKey, LiveSnapshot, OperatingHours } from "@/lib/types";
+import { getZonedNow, minutesInOperatingWindow, parseClockToMinutes } from "@/lib/time";
 import { useConfig } from "@/lib/useConfig";
 
 const CHART_WIDTH = 1000;
 const CHART_HEIGHT = 280;
+const MINUTES_PER_DAY = 24 * 60;
 
 function buildLinePath(values: number[], maxY: number): string {
   if (values.length === 0) {
@@ -60,6 +67,101 @@ function buildTimeTickLabels(labels: string[]): string[] {
   return indexes.map((index) => labels[index]);
 }
 
+function getNextDayKey(dayKey: DayKey): DayKey {
+  const index = DAY_KEYS.indexOf(dayKey);
+  const safeIndex = index >= 0 ? index : 0;
+  return DAY_KEYS[(safeIndex + 1) % DAY_KEYS.length];
+}
+
+function getRemainingMinutesForServiceDay(
+  serviceDayKey: DayKey,
+  actualDayKey: DayKey,
+  hour: number,
+  minute: number,
+  operatingHours: OperatingHours,
+): number {
+  if (operatingHours.isClosed) {
+    return 0;
+  }
+
+  const nowMinutes = hour * 60 + minute;
+  const openingMinutes = parseClockToMinutes(operatingHours.openingTime);
+  const closingMinutes = parseClockToMinutes(operatingHours.closingTime);
+  const operatingMinutes = minutesInOperatingWindow(
+    operatingHours.openingTime,
+    operatingHours.closingTime,
+  );
+  const crossesMidnight = closingMinutes <= openingMinutes;
+  const isServiceDay = actualDayKey === serviceDayKey;
+  const isNextCalendarDay = actualDayKey === getNextDayKey(serviceDayKey);
+
+  if (!crossesMidnight) {
+    if (!isServiceDay) {
+      return 0;
+    }
+
+    if (nowMinutes < openingMinutes) {
+      return operatingMinutes;
+    }
+
+    if (nowMinutes >= closingMinutes) {
+      return 0;
+    }
+
+    return closingMinutes - nowMinutes;
+  }
+
+  if (isServiceDay) {
+    if (nowMinutes >= openingMinutes) {
+      return MINUTES_PER_DAY - nowMinutes + closingMinutes;
+    }
+
+    return operatingMinutes;
+  }
+
+  if (isNextCalendarDay) {
+    if (nowMinutes < closingMinutes) {
+      return closingMinutes - nowMinutes;
+    }
+
+    return 0;
+  }
+
+  return 0;
+}
+
+function getRemainingWeekMinutes(
+  now: Date,
+  timeZone: string,
+  serviceDayKey: DayKey,
+  getHoursForDay: (dayKey: DayKey) => OperatingHours,
+): number {
+  const zonedNow = getZonedNow(now, timeZone);
+  const currentDayHours = getHoursForDay(serviceDayKey);
+  const currentDayRemaining = getRemainingMinutesForServiceDay(
+    serviceDayKey,
+    zonedNow.dayKey,
+    zonedNow.hour,
+    zonedNow.minute,
+    currentDayHours,
+  );
+
+  const serviceDayIndex = DAY_KEYS.indexOf(serviceDayKey);
+  const safeServiceDayIndex = serviceDayIndex >= 0 ? serviceDayIndex : 0;
+
+  let remainingMinutes = currentDayRemaining;
+  for (let index = safeServiceDayIndex + 1; index < DAY_KEYS.length; index += 1) {
+    const dayHours = getHoursForDay(DAY_KEYS[index]);
+    if (dayHours.isClosed) {
+      continue;
+    }
+
+    remainingMinutes += minutesInOperatingWindow(dayHours.openingTime, dayHours.closingTime);
+  }
+
+  return Math.max(0, remainingMinutes);
+}
+
 interface RealtimeErrorState {
   status: number;
   message: string;
@@ -96,6 +198,57 @@ function parseRealtimeError(status: number, payload: unknown): RealtimeErrorStat
     message,
     debugCode,
     missing,
+  };
+}
+
+function describePointOfNoReturn(
+  snapshot: LiveSnapshot,
+  timeZone: string,
+  defaultTargetPercent: number,
+): { targetPercent: number; detail: string } {
+  const pointOfNoReturn = snapshot.pointOfNoReturn;
+  const targetPercent =
+    pointOfNoReturn?.targetWagePercent ?? defaultTargetPercent;
+
+  if (!pointOfNoReturn) {
+    return {
+      targetPercent,
+      detail: "N/A",
+    };
+  }
+
+  if (
+    (pointOfNoReturn.status === "upcoming" || pointOfNoReturn.status === "passed") &&
+    pointOfNoReturn.pointTimeIso
+  ) {
+    const timeLabel = formatClockMinuteIso(pointOfNoReturn.pointTimeIso, timeZone);
+    const minutes = Math.abs(pointOfNoReturn.minutesFromNow ?? 0);
+    return {
+      targetPercent,
+      detail:
+        pointOfNoReturn.status === "upcoming"
+          ? `${timeLabel} (in ${minutes} mins)`
+          : `${timeLabel} (${minutes} mins ago)`,
+    };
+  }
+
+  if (pointOfNoReturn.status === "safe_all_shift") {
+    return {
+      targetPercent,
+      detail: "Safe all shift",
+    };
+  }
+
+  if (pointOfNoReturn.status === "not_last_shift") {
+    return {
+      targetPercent,
+      detail: "Active on final weekly shift only",
+    };
+  }
+
+  return {
+    targetPercent,
+    detail: "N/A",
   };
 }
 
@@ -315,40 +468,47 @@ export default function DashboardPage(): React.JSX.Element {
     snapshot.comparison.lastWeekRevenueCents,
     snapshot.comparison.rollingAverageRevenueCents,
   );
-
-  const contextMax = Math.max(
-    1,
-    snapshot.comparison.lastWeekRevenueCents,
-    snapshot.comparison.rollingAverageRevenueCents,
-  );
-
-  const projectedBarScalePercent = Math.max(
-    2,
-    Math.min(100, (snapshot.totals.projectedRevenueCents / revenueScaleMax) * 100),
-  );
-  const contextBarScalePercent = Math.max(
-    2,
-    Math.min(100, (contextMax / revenueScaleMax) * 100),
+  const projectionMarkerPercent = Math.min(
+    100,
+    (snapshot.totals.projectedRevenueCents / revenueScaleMax) * 100,
   );
 
   const actualFillPercent =
-    snapshot.totals.projectedRevenueCents > 0
-      ? Math.min(
-          100,
-          (snapshot.totals.adjustedRevenueCents / snapshot.totals.projectedRevenueCents) * 100,
-        )
+    revenueScaleMax > 0
+      ? Math.min(100, (snapshot.totals.adjustedRevenueCents / revenueScaleMax) * 100)
       : 0;
 
   const lastWeekMarkerPercent = Math.min(
     100,
-    (snapshot.comparison.lastWeekRevenueCents / contextMax) * 100,
+    (snapshot.comparison.lastWeekRevenueCents / revenueScaleMax) * 100,
   );
   const rollingMarkerPercent = Math.min(
     100,
-    (snapshot.comparison.rollingAverageRevenueCents / contextMax) * 100,
+    (snapshot.comparison.rollingAverageRevenueCents / revenueScaleMax) * 100,
   );
 
   const positiveProjection = snapshot.totals.projectedVsTargetPercent >= 0;
+  const remainingWeekMinutes = getRemainingWeekMinutes(
+    new Date(snapshot.generatedAtIso),
+    config.timezone,
+    snapshot.dayKey,
+    (dayKey) => getOperatingHoursForDay(config, dayKey),
+  );
+  const remainingWeekHours = remainingWeekMinutes / 60;
+  const projectedSingleStaffWagesCents = Math.round(
+    remainingWeekHours * config.averageHourlyRate * 100,
+  );
+  const weeklyRevenueToDateCents = snapshot.weekly?.revenueToDateCents ?? null;
+  const weeklyWagesSpentToDateCents = snapshot.weekly?.wagesToDateCents ?? null;
+  const weeklyProjectedWagesCents =
+    weeklyWagesSpentToDateCents === null
+      ? null
+      : weeklyWagesSpentToDateCents + projectedSingleStaffWagesCents;
+  const pointOfNoReturn = describePointOfNoReturn(
+    snapshot,
+    config.timezone,
+    config.weeklyPointOfNoReturnWagePercent,
+  );
 
   return (
     <section className="grid-cards">
@@ -429,27 +589,21 @@ export default function DashboardPage(): React.JSX.Element {
       <article className="card">
         <h3 className="card-title">Revenue Pace</h3>
         <p className="muted">
-          Top bar tracks tonight against projection. Bottom bar shows last week and 4-week context.
+          Fill tracks tonight&apos;s pace while markers show projection, last week, and 4-week context.
         </p>
 
         <div className="bar-stack">
           <div className="bar-wrap">
-            <span className="bar-label">Tonight Projection</span>
-            <div className="bar-scale" style={{ width: `${projectedBarScalePercent}%` }}>
-              <div className="bar-base">
-                <div className="bar-fill good-bg" style={{ width: `${actualFillPercent}%` }} />
-              </div>
-            </div>
-            <p className="bar-values">
-              {formatCurrencyFromCents(snapshot.totals.adjustedRevenueCents)} /{" "}
-              {formatCurrencyFromCents(snapshot.totals.projectedRevenueCents)}
-            </p>
-          </div>
-
-          <div className="bar-wrap">
-            <span className="bar-label">Historical Context</span>
-            <div className="bar-scale" style={{ width: `${contextBarScalePercent}%` }}>
+            <span className="bar-label">Revenue Pace</span>
+            <div className="bar-scale">
               <div className="context-base">
+                <div className="bar-fill good-bg context-fill" style={{ width: `${actualFillPercent}%` }} />
+                <span
+                  className="marker marker-projection"
+                  style={{ left: `${projectionMarkerPercent}%` }}
+                >
+                  <span className="marker-label">Projection</span>
+                </span>
                 <span className="marker marker-last" style={{ left: `${lastWeekMarkerPercent}%` }}>
                   <span className="marker-label">Last Week</span>
                 </span>
@@ -458,6 +612,10 @@ export default function DashboardPage(): React.JSX.Element {
                 </span>
               </div>
             </div>
+            <p className="bar-values">
+              {formatCurrencyFromCents(snapshot.totals.adjustedRevenueCents)} /{" "}
+              {formatCurrencyFromCents(snapshot.totals.projectedRevenueCents)}
+            </p>
             <p className="bar-values">
               Last Week {formatCurrencyFromCents(snapshot.comparison.lastWeekRevenueCents)} | 4W Avg{" "}
               {formatCurrencyFromCents(snapshot.comparison.rollingAverageRevenueCents)}
@@ -470,6 +628,36 @@ export default function DashboardPage(): React.JSX.Element {
         <h3 className="card-title">Wage Percent Trend</h3>
         <p className="muted">
           Wage % on the vertical axis and service time on the horizontal axis.
+        </p>
+        <p className="muted">
+          Week revenue so far (Square):{" "}
+          <strong>
+            {weeklyRevenueToDateCents === null
+              ? "N/A"
+              : formatCurrencyFromCents(weeklyRevenueToDateCents)}
+          </strong>{" "}
+          | Wages spent so far (Deputy):{" "}
+          <strong>
+            {weeklyWagesSpentToDateCents === null
+              ? "N/A"
+              : formatCurrencyFromCents(weeklyWagesSpentToDateCents)}
+          </strong>
+        </p>
+        <p className="muted">
+          Remaining week roster time: <strong>{remainingWeekHours.toFixed(1)}h</strong> | Remaining
+          wages projection (1 staff):{" "}
+          <strong>{formatCurrencyFromCents(projectedSingleStaffWagesCents)}</strong> | Weekly
+          projected wages:{" "}
+          <strong>
+            {weeklyProjectedWagesCents === null
+              ? "N/A"
+              : formatCurrencyFromCents(weeklyProjectedWagesCents)}
+          </strong>
+        </p>
+        <p className="muted">
+          Point of no return target:{" "}
+          <strong>{formatPercent(pointOfNoReturn.targetPercent, 1)}</strong> | Point of no
+          return: <strong>{pointOfNoReturn.detail}</strong>
         </p>
 
         <div className="wage-chart-layout">

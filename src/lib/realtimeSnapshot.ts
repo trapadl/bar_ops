@@ -13,7 +13,13 @@ import {
   parseClockToMinutes,
   toBusinessDayReference,
 } from "@/lib/time";
-import { AppConfig, LiveSnapshot, OperatingHours } from "@/lib/types";
+import {
+  AppConfig,
+  DayKey,
+  LiveSnapshot,
+  OperatingHours,
+  PointOfNoReturnSnapshot,
+} from "@/lib/types";
 
 const BUCKET_MINUTES = 15;
 const BUCKET_MILLISECONDS = BUCKET_MINUTES * 60 * 1000;
@@ -30,8 +36,10 @@ interface IntegrationSummary {
   fetchedAtIso: string;
   status: {
     squarePayments: IntegrationStatus;
+    squareWeekPayments: IntegrationStatus;
     squareOpenOrders: IntegrationStatus;
     deputyTimesheets: IntegrationStatus;
+    deputyWeekTimesheets: IntegrationStatus;
     deputyEmployees: IntegrationStatus;
     historicalWeek1: IntegrationStatus;
     historicalWeek2: IntegrationStatus;
@@ -40,11 +48,13 @@ interface IntegrationSummary {
   };
   counts: {
     squarePayments: number;
+    squareWeekPayments: number;
     squareOpenOrders: number;
     squareOpenOrdersExcluded: number;
     squareOpenOrdersExcludedCarryoverCents: number;
     squareOpenOrdersExcludedDeltaCents: number;
     deputyTimesheets: number;
+    deputyWeekTimesheets: number;
     deputyEmployees: number;
   };
 }
@@ -69,6 +79,24 @@ interface PromiseResult<T> {
   status: "fulfilled" | "rejected";
   value?: T;
   reason?: string;
+}
+
+interface PointOfNoReturnInputs {
+  config: AppConfig;
+  dayKey: DayKey;
+  localDate: LocalDateParts;
+  timeZone: string;
+  windowStartMs: number;
+  effectiveNowMs: number;
+  completedBucketCount: number;
+  closedRevenueByBucket: number[];
+  laborByBucket: number[];
+  openBillsCents: number;
+  baselineFractions: number[];
+  projectedRevenueCents: number;
+  weeklyRevenueToDateCents: number | null;
+  weeklyWagesToDateCents: number | null;
+  currentHourlySpendRate: number;
 }
 
 interface SquarePayment {
@@ -99,6 +127,25 @@ const excludedOpenOrderBaselineByServiceDay = new Map<
   string,
   ExcludedOpenOrderBaselineEntry
 >();
+
+const DAY_KEY_TO_INDEX: Record<DayKey, number> = {
+  monday: 0,
+  tuesday: 1,
+  wednesday: 2,
+  thursday: 3,
+  friday: 4,
+  saturday: 5,
+  sunday: 6,
+};
+const DAY_KEYS: DayKey[] = [
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday",
+];
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -208,6 +255,30 @@ function buildOperatingWindow(
   const closeDate = closesNextDay ? addDays(localDate, 1) : localDate;
   const end = zonedClockToUtc(closeDate, hours.closingTime, timeZone);
   return { start, end };
+}
+
+function buildServiceWeekWindow(
+  localDate: LocalDateParts,
+  dayKey: DayKey,
+  timeZone: string,
+  effectiveNowMs: number,
+): WindowRange {
+  const dayOffset = DAY_KEY_TO_INDEX[dayKey] ?? 0;
+  const weekStartDate = addDays(localDate, -dayOffset);
+  const start = zonedClockToUtc(weekStartDate, REPORTING_WINDOW_OPENING, timeZone);
+  const end = new Date(Math.max(effectiveNowMs, start.getTime()));
+  return { start, end };
+}
+
+function getLastOpenDayKey(config: AppConfig): DayKey | null {
+  for (let index = DAY_KEYS.length - 1; index >= 0; index -= 1) {
+    const dayKey = DAY_KEYS[index];
+    if (!config.dailyOperatingHours[dayKey].isClosed) {
+      return dayKey;
+    }
+  }
+
+  return null;
 }
 
 function getSquareBaseUrl(environment: "production" | "sandbox"): string {
@@ -824,6 +895,456 @@ function bucketizeRevenue(
   return buckets;
 }
 
+function sumPaymentsInWindow(
+  payments: SquarePayment[],
+  windowStartMs: number,
+  windowEndMs: number,
+): number {
+  let total = 0;
+
+  for (const payment of payments) {
+    const timestamp = payment.createdAt.getTime();
+    if (timestamp < windowStartMs || timestamp >= windowEndMs) {
+      continue;
+    }
+
+    total += Math.max(0, payment.amountCents);
+  }
+
+  return total;
+}
+
+function resolveTimesheetRate(
+  timesheet: DeputyTimesheet,
+  fallbackRate: number,
+  employeeRates: Map<number, number>,
+): number {
+  return (
+    timesheet.hourlyRate ??
+    (timesheet.employeeId !== null
+      ? employeeRates.get(timesheet.employeeId) ?? fallbackRate
+      : fallbackRate)
+  );
+}
+
+function computeTimesheetCostCents(
+  timesheet: DeputyTimesheet,
+  windowStartMs: number,
+  windowEndMs: number,
+  fallbackRate: number,
+  employeeRates: Map<number, number>,
+): number {
+  let startMs = timesheet.startAt.getTime();
+  let endMs = timesheet.endAt ? timesheet.endAt.getTime() : windowEndMs;
+
+  if (endMs <= startMs) {
+    return 0;
+  }
+
+  startMs = Math.max(startMs, windowStartMs);
+  endMs = Math.min(endMs, windowEndMs);
+
+  if (endMs <= startMs) {
+    return 0;
+  }
+
+  const rate = resolveTimesheetRate(timesheet, fallbackRate, employeeRates);
+  if (rate <= 0) {
+    return 0;
+  }
+
+  const hours = (endMs - startMs) / 3_600_000;
+  return Math.round(hours * rate * 100);
+}
+
+function sumTimesheetCostInWindow(
+  timesheets: DeputyTimesheet[],
+  windowStartMs: number,
+  windowEndMs: number,
+  fallbackRate: number,
+  employeeRates: Map<number, number>,
+): number {
+  return timesheets.reduce(
+    (sum, timesheet) =>
+      sum +
+      computeTimesheetCostCents(
+        timesheet,
+        windowStartMs,
+        windowEndMs,
+        fallbackRate,
+        employeeRates,
+      ),
+    0,
+  );
+}
+
+function computeCurrentHourlySpendRate(
+  timesheets: DeputyTimesheet[],
+  effectiveNowMs: number,
+  fallbackRate: number,
+  employeeRates: Map<number, number>,
+): number {
+  let totalRate = 0;
+
+  for (const timesheet of timesheets) {
+    const startMs = timesheet.startAt.getTime();
+    const endMs = timesheet.endAt ? timesheet.endAt.getTime() : Number.POSITIVE_INFINITY;
+    if (startMs > effectiveNowMs || endMs <= effectiveNowMs) {
+      continue;
+    }
+
+    const rate = resolveTimesheetRate(timesheet, fallbackRate, employeeRates);
+    if (rate > 0) {
+      totalRate += rate;
+    }
+  }
+
+  if (totalRate <= 0) {
+    return fallbackRate;
+  }
+
+  return totalRate;
+}
+
+function buildUnavailablePointOfNoReturn(
+  targetWagePercent: number,
+  shiftWindow: WindowRange | null = null,
+): PointOfNoReturnSnapshot {
+  return {
+    targetWagePercent,
+    status: "unavailable",
+    pointTimeIso: null,
+    minutesFromNow: null,
+    projectedWeekWagePercentAtNow: null,
+    shiftStartIso: shiftWindow ? shiftWindow.start.toISOString() : null,
+    shiftEndIso: shiftWindow ? shiftWindow.end.toISOString() : null,
+  };
+}
+
+function buildNotLastShiftPointOfNoReturn(
+  targetWagePercent: number,
+  shiftWindow: WindowRange | null = null,
+): PointOfNoReturnSnapshot {
+  return {
+    targetWagePercent,
+    status: "not_last_shift",
+    pointTimeIso: null,
+    minutesFromNow: null,
+    projectedWeekWagePercentAtNow: null,
+    shiftStartIso: shiftWindow ? shiftWindow.start.toISOString() : null,
+    shiftEndIso: shiftWindow ? shiftWindow.end.toISOString() : null,
+  };
+}
+
+function buildPointOfNoReturnSnapshot({
+  config,
+  dayKey,
+  localDate,
+  timeZone,
+  windowStartMs,
+  effectiveNowMs,
+  completedBucketCount,
+  closedRevenueByBucket,
+  laborByBucket,
+  openBillsCents,
+  baselineFractions,
+  projectedRevenueCents,
+  weeklyRevenueToDateCents,
+  weeklyWagesToDateCents,
+  currentHourlySpendRate,
+}: PointOfNoReturnInputs): PointOfNoReturnSnapshot {
+  const targetWagePercent = config.weeklyPointOfNoReturnWagePercent;
+  const lastOpenDayKey = getLastOpenDayKey(config);
+  if (!lastOpenDayKey) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent);
+  }
+
+  if (dayKey !== lastOpenDayKey) {
+    return buildNotLastShiftPointOfNoReturn(targetWagePercent);
+  }
+
+  const lastShiftHours = config.dailyOperatingHours[lastOpenDayKey];
+  const shiftWindow = buildOperatingWindow(localDate, lastShiftHours, timeZone);
+  const shiftStartMs = shiftWindow.start.getTime();
+  const shiftEndMs = shiftWindow.end.getTime();
+
+  if (effectiveNowMs < shiftStartMs || effectiveNowMs > shiftEndMs) {
+    return buildNotLastShiftPointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  if (weeklyRevenueToDateCents === null || weeklyWagesToDateCents === null) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  const bucketCount = closedRevenueByBucket.length;
+  if (bucketCount === 0 || laborByBucket.length !== bucketCount) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  const currentBucketIndex =
+    completedBucketCount > 0
+      ? clamp(completedBucketCount - 1, 0, bucketCount - 1)
+      : 0;
+  const shiftStartBucketIndex = clamp(
+    Math.floor((shiftStartMs - windowStartMs) / BUCKET_MILLISECONDS),
+    0,
+    bucketCount,
+  );
+  const shiftEndBucketExclusive = clamp(
+    Math.ceil((shiftEndMs - windowStartMs) / BUCKET_MILLISECONDS),
+    0,
+    bucketCount,
+  );
+
+  if (shiftEndBucketExclusive <= shiftStartBucketIndex) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  const adjustedRevenueByBucket = closedRevenueByBucket.map((value, index) =>
+    completedBucketCount > 0 && index === currentBucketIndex
+      ? value + openBillsCents
+      : value,
+  );
+
+  const cumulativeClosedRevenue = cumulative(closedRevenueByBucket);
+  const cumulativeAdjustedRevenue = cumulative(adjustedRevenueByBucket);
+  const cumulativeLabor = cumulative(laborByBucket);
+
+  const beforeShiftClosed =
+    shiftStartBucketIndex > 0 ? (cumulativeClosedRevenue[shiftStartBucketIndex - 1] ?? 0) : 0;
+  const beforeShiftAdjusted =
+    shiftStartBucketIndex > 0
+      ? (cumulativeAdjustedRevenue[shiftStartBucketIndex - 1] ?? 0)
+      : 0;
+  const beforeShiftLabor =
+    shiftStartBucketIndex > 0 ? (cumulativeLabor[shiftStartBucketIndex - 1] ?? 0) : 0;
+
+  const currentClosedTotal =
+    completedBucketCount > 0 ? (cumulativeClosedRevenue[currentBucketIndex] ?? 0) : 0;
+  const currentAdjustedTotal =
+    completedBucketCount > 0 ? (cumulativeAdjustedRevenue[currentBucketIndex] ?? 0) : 0;
+  const currentLaborTotal =
+    completedBucketCount > 0 ? (cumulativeLabor[currentBucketIndex] ?? 0) : 0;
+
+  const shiftClosedNow = Math.max(0, currentClosedTotal - beforeShiftClosed);
+  const shiftAdjustedNow = Math.max(0, currentAdjustedTotal - beforeShiftAdjusted);
+  const shiftLaborNow = Math.max(0, currentLaborTotal - beforeShiftLabor);
+
+  const weekRevenueBeforeShift = Math.max(0, weeklyRevenueToDateCents - shiftClosedNow);
+  const weekWagesBeforeShift = Math.max(0, weeklyWagesToDateCents - shiftLaborNow);
+
+  const baselineBeforeShift =
+    shiftStartBucketIndex > 0 ? (baselineFractions[shiftStartBucketIndex - 1] ?? 0) : 0;
+  const rawExpectedShiftCumulativeByBucket = Array.from({ length: bucketCount }, (_, index) => {
+    const baselineAtIndex = baselineFractions[index] ?? 1;
+    const shiftFraction = Math.max(0, baselineAtIndex - baselineBeforeShift);
+    return Math.round(projectedRevenueCents * shiftFraction);
+  });
+
+  const expectedShiftNowRaw =
+    shiftStartBucketIndex <= currentBucketIndex
+      ? rawExpectedShiftCumulativeByBucket[currentBucketIndex] ?? 0
+      : 0;
+  const shiftAlignment = shiftAdjustedNow - expectedShiftNowRaw;
+
+  const alignedExpectedShiftCumulativeByBucket = Array.from(
+    { length: bucketCount },
+    () => 0,
+  );
+  let runningExpectedShift = 0;
+  for (let index = shiftStartBucketIndex; index < shiftEndBucketExclusive; index += 1) {
+    const rawShiftValue = rawExpectedShiftCumulativeByBucket[index] ?? 0;
+    let aligned = Math.max(0, rawShiftValue + shiftAlignment);
+    aligned = Math.max(runningExpectedShift, aligned);
+
+    if (index === currentBucketIndex) {
+      aligned = Math.max(runningExpectedShift, shiftAdjustedNow);
+    }
+
+    runningExpectedShift = aligned;
+    alignedExpectedShiftCumulativeByBucket[index] = aligned;
+  }
+
+  const shiftCloseBucketIndex = shiftEndBucketExclusive - 1;
+  const expectedShiftClose =
+    alignedExpectedShiftCumulativeByBucket[shiftCloseBucketIndex] ?? shiftAdjustedNow;
+
+  if (expectedShiftClose <= 0) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  interface PnrPoint {
+    timeMs: number;
+    projectedWeekWagePercent: number | null;
+  }
+
+  const points: PnrPoint[] = [];
+
+  const pushPoint = (
+    timeMs: number,
+    revenueSoFarShiftCents: number,
+    expectedRevenueSoFarShiftCents: number,
+    wagesSoFarShiftCents: number,
+  ): void => {
+    const expectedRemainingRevenueCents = Math.max(
+      0,
+      expectedShiftClose - expectedRevenueSoFarShiftCents,
+    );
+    const remainingShiftHours = Math.max(0, (shiftEndMs - timeMs) / 3_600_000);
+    const oneStaffRemainingWagesCents = Math.round(
+      remainingShiftHours * config.averageHourlyRate * 100,
+    );
+    const projectedWeekRevenueCents =
+      weekRevenueBeforeShift + revenueSoFarShiftCents + expectedRemainingRevenueCents;
+    const projectedWeekWagesCents =
+      weekWagesBeforeShift + wagesSoFarShiftCents + oneStaffRemainingWagesCents;
+
+    points.push({
+      timeMs,
+      projectedWeekWagePercent: toPercent(projectedWeekWagesCents, projectedWeekRevenueCents),
+    });
+  };
+
+  pushPoint(shiftStartMs, 0, 0, 0);
+
+  for (
+    let bucketIndex = shiftStartBucketIndex;
+    bucketIndex < shiftEndBucketExclusive;
+    bucketIndex += 1
+  ) {
+    const boundaryTimeMs = Math.min(
+      shiftEndMs,
+      windowStartMs + (bucketIndex + 1) * BUCKET_MILLISECONDS,
+    );
+
+    if (boundaryTimeMs >= effectiveNowMs) {
+      break;
+    }
+
+    const actualShiftRevenue = Math.max(
+      0,
+      (cumulativeAdjustedRevenue[bucketIndex] ?? 0) - beforeShiftAdjusted,
+    );
+    const actualShiftWages = Math.max(
+      0,
+      (cumulativeLabor[bucketIndex] ?? 0) - beforeShiftLabor,
+    );
+    const expectedShiftRevenue =
+      alignedExpectedShiftCumulativeByBucket[bucketIndex] ?? actualShiftRevenue;
+
+    pushPoint(
+      boundaryTimeMs,
+      actualShiftRevenue,
+      expectedShiftRevenue,
+      actualShiftWages,
+    );
+  }
+
+  pushPoint(effectiveNowMs, shiftAdjustedNow, shiftAdjustedNow, shiftLaborNow);
+
+  for (
+    let bucketIndex = Math.max(currentBucketIndex, shiftStartBucketIndex);
+    bucketIndex < shiftEndBucketExclusive;
+    bucketIndex += 1
+  ) {
+    const boundaryTimeMs = Math.min(
+      shiftEndMs,
+      windowStartMs + (bucketIndex + 1) * BUCKET_MILLISECONDS,
+    );
+
+    if (boundaryTimeMs <= effectiveNowMs) {
+      continue;
+    }
+
+    const expectedShiftRevenue = Math.max(
+      shiftAdjustedNow,
+      alignedExpectedShiftCumulativeByBucket[bucketIndex] ?? shiftAdjustedNow,
+    );
+    const projectedShiftWages =
+      shiftLaborNow +
+      Math.round(((boundaryTimeMs - effectiveNowMs) / 3_600_000) * currentHourlySpendRate * 100);
+
+    pushPoint(
+      boundaryTimeMs,
+      expectedShiftRevenue,
+      expectedShiftRevenue,
+      projectedShiftWages,
+    );
+  }
+
+  if (points.length === 0) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  const validPoints = points.filter(
+    (point): point is PnrPoint & { projectedWeekWagePercent: number } =>
+      point.projectedWeekWagePercent !== null,
+  );
+  if (validPoints.length === 0) {
+    return buildUnavailablePointOfNoReturn(targetWagePercent, shiftWindow);
+  }
+
+  const projectedWeekWagePercentAtNow =
+    points.find((point) => point.timeMs === effectiveNowMs)?.projectedWeekWagePercent ?? null;
+
+  let crossingTimeMs: number | null = null;
+  for (let index = 0; index < validPoints.length; index += 1) {
+    const point = validPoints[index];
+    if (point.projectedWeekWagePercent < targetWagePercent) {
+      continue;
+    }
+
+    if (index === 0) {
+      crossingTimeMs = point.timeMs;
+      break;
+    }
+
+    const previousPoint = validPoints[index - 1];
+
+    if (previousPoint.projectedWeekWagePercent >= targetWagePercent) {
+      crossingTimeMs = previousPoint.timeMs;
+      break;
+    }
+
+    const previousDelta = previousPoint.projectedWeekWagePercent - targetWagePercent;
+    const currentDelta = point.projectedWeekWagePercent - targetWagePercent;
+    const deltaChange = currentDelta - previousDelta;
+    if (Math.abs(deltaChange) < 0.00001) {
+      crossingTimeMs = point.timeMs;
+      break;
+    }
+
+    const interpolation = clamp(-previousDelta / deltaChange, 0, 1);
+    crossingTimeMs = Math.round(
+      previousPoint.timeMs + (point.timeMs - previousPoint.timeMs) * interpolation,
+    );
+    break;
+  }
+
+  if (crossingTimeMs === null) {
+    return {
+      targetWagePercent,
+      status: "safe_all_shift",
+      pointTimeIso: null,
+      minutesFromNow: null,
+      projectedWeekWagePercentAtNow,
+      shiftStartIso: shiftWindow.start.toISOString(),
+      shiftEndIso: shiftWindow.end.toISOString(),
+    };
+  }
+
+  const minutesFromNow = Math.round((crossingTimeMs - effectiveNowMs) / 60_000);
+  return {
+    targetWagePercent,
+    status: crossingTimeMs <= effectiveNowMs ? "passed" : "upcoming",
+    pointTimeIso: new Date(crossingTimeMs).toISOString(),
+    minutesFromNow,
+    projectedWeekWagePercentAtNow,
+    shiftStartIso: shiftWindow.start.toISOString(),
+    shiftEndIso: shiftWindow.end.toISOString(),
+  };
+}
+
 function distributeLabor(
   bucketLabor: number[],
   windowStartMs: number,
@@ -846,11 +1367,7 @@ function distributeLabor(
     return;
   }
 
-  const rate =
-    timesheet.hourlyRate ??
-    (timesheet.employeeId !== null
-      ? employeeRates.get(timesheet.employeeId) ?? fallbackRate
-      : fallbackRate);
+  const rate = resolveTimesheetRate(timesheet, fallbackRate, employeeRates);
 
   if (rate <= 0) {
     return;
@@ -952,6 +1469,14 @@ export async function buildRealtimeSnapshot(
   const windowEndMs = window.end.getTime();
   const nowMs = Date.now();
   const effectiveNowMs = clamp(nowMs, windowStartMs, windowEndMs);
+  const weekWindow = buildServiceWeekWindow(
+    localDate,
+    dayKey,
+    config.timezone,
+    effectiveNowMs,
+  );
+  const weekWindowStartMs = weekWindow.start.getTime();
+  const weekWindowEndMs = weekWindow.end.getTime();
   const elapsedMinutes = Math.max(0, (effectiveNowMs - windowStartMs) / 60_000);
   const operatingWindowMinutes = Math.max(1, (windowEndMs - windowStartMs) / 60_000);
   const elapsedFraction = clamp(elapsedMinutes / operatingWindowMinutes, 0, 1);
@@ -968,17 +1493,23 @@ export async function buildRealtimeSnapshot(
     windowStartIso: window.start.toISOString(),
     windowEndIso: window.end.toISOString(),
     effectiveNowIso: new Date(effectiveNowMs).toISOString(),
+    weekWindowStartIso: weekWindow.start.toISOString(),
+    weekWindowEndIso: weekWindow.end.toISOString(),
   });
 
   const [
     squarePaymentsResult,
+    squareWeekPaymentsResult,
     squareOpenOrdersResult,
     deputyTimesheetsResult,
+    deputyWeekTimesheetsResult,
     deputyEmployeesResult,
   ] = await Promise.all([
     settled(() => fetchSquarePayments(config, window)),
+    settled(() => fetchSquarePayments(config, weekWindow)),
     settled(() => fetchSquareOpenOrders(config)),
     settled(() => fetchDeputyTimesheets(config, window)),
+    settled(() => fetchDeputyTimesheets(config, weekWindow)),
     settled(() =>
       fetchDeputyCollection(config, [
         "/api/v1/resource/Employee?max=500",
@@ -990,11 +1521,17 @@ export async function buildRealtimeSnapshot(
   if (squarePaymentsResult.status === "rejected") {
     log("realtime", "Square payments failed", squarePaymentsResult.reason);
   }
+  if (squareWeekPaymentsResult.status === "rejected") {
+    log("realtime", "Square week payments failed", squareWeekPaymentsResult.reason);
+  }
   if (squareOpenOrdersResult.status === "rejected") {
     log("realtime", "Square open orders failed", squareOpenOrdersResult.reason);
   }
   if (deputyTimesheetsResult.status === "rejected") {
     log("realtime", "Deputy timesheets failed", deputyTimesheetsResult.reason);
+  }
+  if (deputyWeekTimesheetsResult.status === "rejected") {
+    log("realtime", "Deputy week timesheets failed", deputyWeekTimesheetsResult.reason);
   }
   if (deputyEmployeesResult.status === "rejected") {
     log("realtime", "Deputy employees failed", deputyEmployeesResult.reason);
@@ -1003,6 +1540,11 @@ export async function buildRealtimeSnapshot(
   const payments =
     squarePaymentsResult.status === "fulfilled"
       ? extractSquarePayments(squarePaymentsResult.value ?? [])
+      : [];
+
+  const weekPayments =
+    squareWeekPaymentsResult.status === "fulfilled"
+      ? extractSquarePayments(squareWeekPaymentsResult.value ?? [])
       : [];
 
   const openOrders =
@@ -1015,16 +1557,30 @@ export async function buildRealtimeSnapshot(
       ? extractDeputyTimesheets(deputyTimesheetsResult.value ?? [])
       : [];
 
+  const weekTimesheets =
+    deputyWeekTimesheetsResult.status === "fulfilled"
+      ? extractDeputyTimesheets(deputyWeekTimesheetsResult.value ?? [])
+      : [];
+
   const employeeRates =
     deputyEmployeesResult.status === "fulfilled"
       ? extractDeputyEmployeeRateMap(deputyEmployeesResult.value ?? [])
       : new Map<number, number>();
+  const currentHourlySpendRate = computeCurrentHourlySpendRate(
+    timesheets,
+    effectiveNowMs,
+    config.averageHourlyRate,
+    employeeRates,
+  );
 
   log("realtime", "Deputy timesheets parsed", {
     rawStatus: deputyTimesheetsResult.status,
     parsedTimesheets: timesheets.length,
     inProgressTimesheets: timesheets.filter((timesheet) => timesheet.endAt === null).length,
+    rawWeekStatus: deputyWeekTimesheetsResult.status,
+    parsedWeekTimesheets: weekTimesheets.length,
     employeeRateCount: employeeRates.size,
+    currentHourlySpendRate,
   });
 
   const closedRevenueByBucket = bucketizeRevenue(
@@ -1109,6 +1665,29 @@ export async function buildRealtimeSnapshot(
     actualRevenueCents + (completedBucketCount > 0 ? openBillsCents : 0);
   const laborCostCents = cumulativeLabor[completedBucketCount - 1] ?? 0;
   const wagePercent = toPercent(laborCostCents, adjustedRevenueCents);
+  const weeklyRevenueToDateCents =
+    squareWeekPaymentsResult.status === "fulfilled"
+      ? sumPaymentsInWindow(weekPayments, weekWindowStartMs, weekWindowEndMs)
+      : null;
+  const weeklyWagesToDateCents =
+    deputyWeekTimesheetsResult.status === "fulfilled"
+      ? sumTimesheetCostInWindow(
+          weekTimesheets,
+          weekWindowStartMs,
+          weekWindowEndMs,
+          config.averageHourlyRate,
+          employeeRates,
+        )
+      : null;
+
+  log("realtime", "Weekly totals", {
+    weekWindowStartIso: weekWindow.start.toISOString(),
+    weekWindowEndIso: weekWindow.end.toISOString(),
+    weekRevenueStatus: squareWeekPaymentsResult.status,
+    weekWagesStatus: deputyWeekTimesheetsResult.status,
+    weekRevenueToDateCents: weeklyRevenueToDateCents,
+    weekWagesToDateCents: weeklyWagesToDateCents,
+  });
 
   const comparableTotals: number[] = [];
   const comparableSeries: number[][] = [];
@@ -1168,6 +1747,23 @@ export async function buildRealtimeSnapshot(
     rollingAverageRevenueCents,
     elapsedFraction,
   );
+  const pointOfNoReturn = buildPointOfNoReturnSnapshot({
+    config,
+    dayKey,
+    localDate,
+    timeZone: config.timezone,
+    windowStartMs,
+    effectiveNowMs,
+    completedBucketCount,
+    closedRevenueByBucket,
+    laborByBucket,
+    openBillsCents: completedBucketCount > 0 ? openBillsCents : 0,
+    baselineFractions,
+    projectedRevenueCents: projection.rampedProjectedTotalCents,
+    weeklyRevenueToDateCents,
+    weeklyWagesToDateCents,
+    currentHourlySpendRate,
+  });
 
   const projectedVsTargetPercent =
     target.revenueTargetCents > 0
@@ -1203,6 +1799,12 @@ export async function buildRealtimeSnapshot(
   const snapshot: LiveSnapshot = {
     generatedAtIso: new Date().toISOString(),
     dayKey,
+    weekly: {
+      weekStartIso: weekWindow.start.toISOString(),
+      revenueToDateCents: weeklyRevenueToDateCents,
+      wagesToDateCents: weeklyWagesToDateCents,
+    },
+    pointOfNoReturn,
     totals: {
       actualRevenueCents,
       openBillsCents: completedBucketCount > 0 ? openBillsCents : 0,
@@ -1230,8 +1832,10 @@ export async function buildRealtimeSnapshot(
     fetchedAtIso: new Date().toISOString(),
     status: {
       squarePayments: squarePaymentsResult.status,
+      squareWeekPayments: squareWeekPaymentsResult.status,
       squareOpenOrders: squareOpenOrdersResult.status,
       deputyTimesheets: deputyTimesheetsResult.status,
+      deputyWeekTimesheets: deputyWeekTimesheetsResult.status,
       deputyEmployees: deputyEmployeesResult.status,
       historicalWeek1: historicalStatuses[0] ?? "skipped",
       historicalWeek2: historicalStatuses[1] ?? "skipped",
@@ -1240,11 +1844,13 @@ export async function buildRealtimeSnapshot(
     },
     counts: {
       squarePayments: payments.length,
+      squareWeekPayments: weekPayments.length,
       squareOpenOrders: openOrders.length,
       squareOpenOrdersExcluded: excludedOpenOrders.length,
       squareOpenOrdersExcludedCarryoverCents: excludedCarryoverBaselineCents,
       squareOpenOrdersExcludedDeltaCents: excludedOpenOrdersDeltaCents,
       deputyTimesheets: timesheets.length,
+      deputyWeekTimesheets: weekTimesheets.length,
       deputyEmployees: employeeRates.size,
     },
   };

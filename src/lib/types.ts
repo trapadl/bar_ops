@@ -41,6 +41,7 @@ export interface AppConfig {
   dailyOperatingHours: Record<DayKey, OperatingHours>;
   averageBillLengthMinutes: number;
   averageHourlyRate: number;
+  weeklyPointOfNoReturnWagePercent: number;
   refreshIntervalSeconds: number;
   excludedOpenOrderLabels: string[];
   dataSourceMode: DataSourceMode;
@@ -86,9 +87,34 @@ export interface HistorySnapshot {
   comparableNights: ComparableNight[];
 }
 
+export interface WeeklySnapshot {
+  weekStartIso: string;
+  revenueToDateCents: number | null;
+  wagesToDateCents: number | null;
+}
+
+export type PointOfNoReturnStatus =
+  | "upcoming"
+  | "passed"
+  | "safe_all_shift"
+  | "not_last_shift"
+  | "unavailable";
+
+export interface PointOfNoReturnSnapshot {
+  targetWagePercent: number;
+  status: PointOfNoReturnStatus;
+  pointTimeIso: string | null;
+  minutesFromNow: number | null;
+  projectedWeekWagePercentAtNow: number | null;
+  shiftStartIso: string | null;
+  shiftEndIso: string | null;
+}
+
 export interface LiveSnapshot {
   generatedAtIso: string;
   dayKey: DayKey;
+  weekly?: WeeklySnapshot;
+  pointOfNoReturn?: PointOfNoReturnSnapshot;
   totals: {
     actualRevenueCents: number;
     openBillsCents: number;

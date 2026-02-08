@@ -306,6 +306,23 @@ function ConfigEditor({
           </label>
 
           <label className="field">
+            <span>Weekly Point-Of-No-Return Wage Target (%)</span>
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={0.1}
+              value={draftConfig.weeklyPointOfNoReturnWagePercent}
+              onChange={(event) =>
+                updateDraft((previous) => ({
+                  ...previous,
+                  weeklyPointOfNoReturnWagePercent: toPositiveNumber(event.target.value, 0),
+                }))
+              }
+            />
+          </label>
+
+          <label className="field">
             <span>Excluded Debtor/Open Table Labels</span>
             <p className="muted">
               Select currently open tables to exclude carryover from adjusted revenue and

@@ -61,6 +61,7 @@ const DEFAULT_DEPUTY_CONFIG: DeputyAccessConfig = {
 };
 
 const DEFAULT_EXCLUDED_OPEN_ORDER_LABELS = ["walkouts", "wastage", "managers"];
+const DEFAULT_WEEKLY_PNR_WAGE_PERCENT = 26;
 
 export const DEFAULT_CONFIG: AppConfig = {
   storeName: "BarOps Adelaide",
@@ -70,6 +71,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   dailyOperatingHours: cloneOperatingHours(DEFAULT_DAILY_OPERATING_HOURS),
   averageBillLengthMinutes: 55,
   averageHourlyRate: 32,
+  weeklyPointOfNoReturnWagePercent: DEFAULT_WEEKLY_PNR_WAGE_PERCENT,
   refreshIntervalSeconds: 60,
   excludedOpenOrderLabels: [...DEFAULT_EXCLUDED_OPEN_ORDER_LABELS],
   dataSourceMode: "sample",
@@ -308,6 +310,14 @@ export function sanitizeConfig(input: Partial<AppConfig> | null | undefined): Ap
       Number(source.averageHourlyRate ?? DEFAULT_CONFIG.averageHourlyRate),
       5,
       200,
+    ),
+    weeklyPointOfNoReturnWagePercent: clampNumber(
+      Number(
+        source.weeklyPointOfNoReturnWagePercent ??
+          DEFAULT_CONFIG.weeklyPointOfNoReturnWagePercent,
+      ),
+      0,
+      100,
     ),
     refreshIntervalSeconds: Math.round(
       clampNumber(
